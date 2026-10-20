@@ -1,0 +1,6 @@
+// expect: error «a scene has one blur»
+scene BlurTwice {
+    surface { size: 100, 100 }
+    blur = file "shaders/blur.wgsl" { passes: down 0.5 }
+    blur = file "shaders/blur.wgsl" { passes: up 2 }
+}

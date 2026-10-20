@@ -128,8 +128,9 @@ impl Hub {
     }
 }
 
-/// We say we do not understand markup, but some send it anyway.
-fn strip_markup(s: &str) -> String {
+/// We say we do not understand markup, but some send it anyway. The tray's
+/// tooltips are read with it too.
+pub(super) fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut inside = false;
     for c in s.chars() {
@@ -140,7 +141,20 @@ fn strip_markup(s: &str) -> String {
             _ => {}
         }
     }
-    out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'")
+    // One pass, so that what an entity gives is not read again: `&amp;lt;`
+    // is the text `&lt;`, not `<`.
+    let mut text = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(k) = rest.find('&') {
+        text.push_str(&rest[..k]);
+        rest = &rest[k..];
+        let entity = [("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>'), ("&quot;", '"'), ("&apos;", '\'')].into_iter().find(|(e, _)| rest.starts_with(e));
+        let (taken, c) = entity.map_or((1, '&'), |(e, c)| (e.len(), c));
+        text.push(c);
+        rest = &rest[taken..];
+    }
+    text.push_str(rest);
+    text
 }
 
 /// `image-data`: `(width, height, rowstride, has_alpha, bits_per_sample, channels, data)`.
@@ -369,4 +383,17 @@ pub fn command(what: &str, args: &[SysValue]) -> Result<(), String> {
     }
     hub.send(Event::Change);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_markup;
+
+    #[test]
+    fn markup_is_dropped_and_each_entity_read_once() {
+        assert_eq!(strip_markup("<b>3</b> new &amp; unread"), "3 new & unread");
+        assert_eq!(strip_markup("&lt;&gt;&quot;&apos;"), "<>\"'");
+        assert_eq!(strip_markup("&amp;lt;b&amp;gt; is bold"), "&lt;b&gt; is bold");
+        assert_eq!(strip_markup("fish & chips &copy;"), "fish & chips &copy;");
+    }
 }

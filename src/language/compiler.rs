@@ -2096,6 +2096,73 @@ impl<'a> Compiler<'a> {
                     self.shaders.insert(name, self.e.shaders.len() as u16);
                     self.e.shaders.push(shader);
                 }
+                // `blur = file "blur.wgsl" { passes: down 0.5 repeat 4, up 2 repeat 3; values: …; reach: 34 }`:
+                // the frosting behind every glass of the scene, as passes of its own (`blur.rs`).
+                "blur" if matches!(c.tokens.get(1).map(|x| &x.kind), Some(TokenKind::Sym("="))) => {
+                    c.expect_sym("=")?;
+                    if !c.word("file") {
+                        return c.error("a blur comes from a file: `blur = file \"blur.wgsl\" { passes: down 0.5 repeat 4, up 2 repeat 3 }`");
+                    }
+                    let shown = c.string()?;
+                    c.expect_end()?;
+                    let written = std::path::PathBuf::from(&shown);
+                    let path = match self.dirs.get(n.line / super::PER_FILE) {
+                        Some(k) if written.is_relative() => k.join(written),
+                        _ => written,
+                    };
+                    let mut p = self.properties(n, vocab::properties("blur"))?;
+                    // Each pass: its function, its size next to the one before,
+                    // `repeat n` and `keep k`, separated by commas.
+                    let mut passes = Vec::new();
+                    let Some(pc) = p.get_mut("passes") else {
+                        return Err(CompileError::at(n.line, n.col, "a blur says its passes: `passes: down 0.5 repeat 4, up 2 repeat 3`".to_string()));
+                    };
+                    loop {
+                        let function = pc.id("the function of a pass")?;
+                        let scale = pc.num()?;
+                        let repeat = if pc.word("repeat") { pc.num()?.max(1.0) as u32 } else { 1 };
+                        let keep = if pc.word("keep") {
+                            let k = pc.num()?;
+                            if !(0.0..=3.0).contains(&k) {
+                                return pc.error("a pass keeps its picture in one of four slots, 0 to 3");
+                            }
+                            Some(k as u8)
+                        } else {
+                            None
+                        };
+                        passes.push(crate::blur::Pass { function, scale, repeat, keep });
+                        if !pc.sym(",") {
+                            break;
+                        }
+                    }
+                    pc.expect_end()?;
+                    // Up to eight numbers, `s.a` and `s.b`, worked out every frame.
+                    let mut values = Vec::new();
+                    if let Some(vc) = p.get_mut("values") {
+                        loop {
+                            values.push(self.expr(vc)?);
+                            if !vc.sym(",") {
+                                break;
+                            }
+                        }
+                        if values.len() > 8 {
+                            return vc.error("a blur takes up to eight numbers: `s.a` and `s.b`, four each");
+                        }
+                    }
+                    let reach = match p.get_mut("reach") {
+                        Some(rc) => rc.num()?,
+                        // Enough for a blur of a few passes; one that reaches further says so.
+                        None => 32.0,
+                    };
+                    let plan = crate::blur::load(&path, &shown, &passes, reach).map_err(|m| CompileError::at(n.line, n.col, m))?;
+                    // A scene copied per monitor reads it once per copy: the same one again is fine.
+                    if self.e.blur.as_ref().is_some_and(|b| *b != plan) {
+                        return Err(CompileError::at(n.line, n.col, "a scene has one blur: this one would replace the one above".to_string()));
+                    }
+                    self.e.attachments.push(path);
+                    self.e.blur = Some(plan);
+                    self.e.blur_values = values;
+                }
                 "measure" => {
                     let local = c.id("a name for the measure")?;
                     let name = self.declare(&local);
@@ -2785,7 +2852,8 @@ impl<'a> Compiler<'a> {
     }
 
     /// `glass` and what goes with it: `lens`, `shine`, `refraction`,
-    /// `dispersion`, `dome`, `ripple`, `frost`, `smoke` and `milk`. Without glass there is nothing for
+    /// `dispersion`, `dome`, `ripple`, `frost`, `smoke`, `milk`, `tint`, `vivid`, `mirror` and
+    /// `highlight`. Without glass there is nothing for
     /// any of them to do.
     fn glass_spec(&self, p: &mut HashMap<&str, Cur>, n: &Node) -> R<Option<Glass>> {
         let mut one = |k: &str| -> R<Option<Expr>> {
@@ -2800,6 +2868,7 @@ impl<'a> Compiler<'a> {
         };
         let (glass, lens, refraction, dispersion, dome, ripple) = (one("glass")?, one("lens")?, one("refraction")?, one("dispersion")?, one("dome")?, one("ripple")?);
         let (smoke, milk) = (one("smoke")?, one("milk")?);
+        let (tint, vivid, mirror, highlight) = (one("tint")?, one("vivid")?, one("mirror")?, one("highlight")?);
         // `frost: auto` is frosted only where what is behind is busy; else how much.
         let frost = match p.get_mut("frost") {
             Some(c) => {
@@ -2826,7 +2895,7 @@ impl<'a> Compiler<'a> {
             None => None,
         };
         let Some(g) = glass else {
-            let loose = [("lens", lens.is_some()), ("shine", shine.is_some()), ("refraction", refraction.is_some()), ("dispersion", dispersion.is_some()), ("dome", dome.is_some()), ("ripple", ripple.is_some()), ("frost", frost.is_some()), ("smoke", smoke.is_some()), ("milk", milk.is_some())];
+            let loose = [("lens", lens.is_some()), ("shine", shine.is_some()), ("refraction", refraction.is_some()), ("dispersion", dispersion.is_some()), ("dome", dome.is_some()), ("ripple", ripple.is_some()), ("frost", frost.is_some()), ("smoke", smoke.is_some()), ("milk", milk.is_some()), ("tint", tint.is_some()), ("vivid", vivid.is_some()), ("mirror", mirror.is_some()), ("highlight", highlight.is_some())];
             return match loose.iter().find(|w| w.1) {
                 Some((w, _)) => Err(CompileError::at(n.line, n.col, format!("`{w}` is something glass does, and here there is no `glass`: `glass: 100%; {w}: …`"))),
                 None => Ok(None),
@@ -2843,6 +2912,10 @@ impl<'a> Compiler<'a> {
             frost: frost.unwrap_or(Expr::K(1.0)),
             smoke: smoke.map_or(Expr::K(0.0), |e| e.clamp(0.0, 1.0)),
             milk: milk.map_or(Expr::K(0.0), |e| e.clamp(0.0, 1.0)),
+            tint: tint.map_or(Expr::K(0.22), |e| e.clamp(0.0, 1.0)),
+            vivid: vivid.map_or(Expr::K(1.18), |e| e.max(0.0)),
+            mirror: mirror.map_or(Expr::K(1.0), |e| e.max(0.0)),
+            highlight: highlight.map_or(Expr::K(1.0), |e| e.max(0.0)),
         }))
     }
 
@@ -6875,21 +6948,8 @@ fn reach(c: &mut Cur) -> R<Reach> {
 }
 
 fn read_cursor(c: &mut Cur) -> R<Cursor> {
-    Ok(match c.one_of(vocab::CURSORS, "a cursor")?.as_str() {
-        "default" => Cursor::Normal,
-        "pointer" => Cursor::Hand,
-        "text" => Cursor::Text,
-        "grab" => Cursor::Grab,
-        "grabbing" => Cursor::Grabbing,
-        "ew_resize" => Cursor::EwResize,
-        "ns_resize" => Cursor::NsResize,
-        "nwse_resize" => Cursor::NwseResize,
-        "nesw_resize" => Cursor::NeswResize,
-        "move" => Cursor::Move,
-        "not_allowed" => Cursor::NotAllowed,
-        "crosshair" => Cursor::Crosshair,
-        _ => unreachable!(),
-    })
+    let name = c.one_of(vocab::CURSORS, "a cursor")?;
+    Ok(Cursor::from_name(&name).unwrap_or_default())
 }
 
 struct ParsedShape {

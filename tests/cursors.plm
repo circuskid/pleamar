@@ -1,0 +1,41 @@
+// expect: ok
+// Every standard cursor, by its name.
+scene Cursors {
+    surface { size: 400, 400 }
+    zone box c0 { at: 30, 30; size: 50, 50; cursor: default }
+    zone box c1 { at: 90, 30; size: 50, 50; cursor: pointer }
+    zone box c2 { at: 150, 30; size: 50, 50; cursor: text }
+    zone box c3 { at: 210, 30; size: 50, 50; cursor: grab }
+    zone box c4 { at: 270, 30; size: 50, 50; cursor: grabbing }
+    zone box c5 { at: 330, 30; size: 50, 50; cursor: ew_resize }
+    zone box c6 { at: 30, 90; size: 50, 50; cursor: ns_resize }
+    zone box c7 { at: 90, 90; size: 50, 50; cursor: nwse_resize }
+    zone box c8 { at: 150, 90; size: 50, 50; cursor: nesw_resize }
+    zone box c9 { at: 210, 90; size: 50, 50; cursor: move }
+    zone box c10 { at: 270, 90; size: 50, 50; cursor: not_allowed }
+    zone box c11 { at: 330, 90; size: 50, 50; cursor: crosshair }
+    zone box c12 { at: 30, 150; size: 50, 50; cursor: context_menu }
+    zone box c13 { at: 90, 150; size: 50, 50; cursor: help }
+    zone box c14 { at: 150, 150; size: 50, 50; cursor: progress }
+    zone box c15 { at: 210, 150; size: 50, 50; cursor: wait }
+    zone box c16 { at: 270, 150; size: 50, 50; cursor: cell }
+    zone box c17 { at: 330, 150; size: 50, 50; cursor: vertical_text }
+    zone box c18 { at: 30, 210; size: 50, 50; cursor: alias }
+    zone box c19 { at: 90, 210; size: 50, 50; cursor: copy }
+    zone box c20 { at: 150, 210; size: 50, 50; cursor: no_drop }
+    zone box c21 { at: 210, 210; size: 50, 50; cursor: e_resize }
+    zone box c22 { at: 270, 210; size: 50, 50; cursor: n_resize }
+    zone box c23 { at: 330, 210; size: 50, 50; cursor: ne_resize }
+    zone box c24 { at: 30, 270; size: 50, 50; cursor: nw_resize }
+    zone box c25 { at: 90, 270; size: 50, 50; cursor: s_resize }
+    zone box c26 { at: 150, 270; size: 50, 50; cursor: se_resize }
+    zone box c27 { at: 210, 270; size: 50, 50; cursor: sw_resize }
+    zone box c28 { at: 270, 270; size: 50, 50; cursor: w_resize }
+    zone box c29 { at: 330, 270; size: 50, 50; cursor: col_resize }
+    zone box c30 { at: 30, 330; size: 50, 50; cursor: row_resize }
+    zone box c31 { at: 90, 330; size: 50, 50; cursor: all_scroll }
+    zone box c32 { at: 150, 330; size: 50, 50; cursor: zoom_in }
+    zone box c33 { at: 210, 330; size: 50, 50; cursor: zoom_out }
+    zone box c34 { at: 270, 330; size: 50, 50; cursor: dnd_ask }
+    zone box c35 { at: 330, 330; size: 50, 50; cursor: all_resize }
+}

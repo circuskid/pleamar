@@ -22,6 +22,8 @@ scene Services {
     service clock.seconds as tick { second: number }
     //  Without `as`, each field is prefixed with the service name: `audio.volume`.
     service audio { volume: number; muted: bool }
+    //  How loud what plays is, not the volume: a meter's bar.
+    service audio.level as vu { level: number }
     service battery as bat { present: bool; percent: number; charging: bool }
     service network as net {
         online: bool
@@ -39,8 +41,8 @@ scene Services {
         pairing_name: text
         pairing_code: text
     }
-    service media as song { playing: bool; title: text; artist: text; album: text; length: number; position: number; rate: number; art: text; player: text }
-    service window as win { title: text; class: text }
+    service media as song { playing: bool; title: text; artist: text; album: text; length: number; position: number; rate: number; can_seek: bool; art: text; player: text }
+    service window as win { title: text; class: text; fullscreen: bool; maximized: bool }
     service thumbnails as thumbs { capturing: bool }
 
     column { at: 12, 12; gap: 6
@@ -52,6 +54,7 @@ scene Services {
         text "{bt.pairing_name} ({bt.pairing_address}): {bt.pairing_code}?" { size: 11; color: #f5f7f5; show: bt.pairing == confirm }
         row { gap: 6
             box { size: 40 * audio.volume, 4; color: #9ed6bd; show: not audio.muted }
+            box { size: 40 * vu.level, 4; color: #9ed6bd }
             box { size: 40 * bat.percent, 4; color: #e8c07a; show: bat.present and not bat.charging }
             box { size: 4, 4; color: #f5f7f5; show: net.strength > 50 }
         }

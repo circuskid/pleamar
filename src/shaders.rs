@@ -154,7 +154,7 @@ fn check(source: &str, path: &str) -> Result<naga::Module, String> {
 /// naga's message without its insides: «Function [2] 'shade' is invalid: The
 /// `return` expression Some([2]) does not match…» says the same without the
 /// handles, which mean nothing to whoever wrote the shader.
-fn readable(message: &str) -> String {
+pub(crate) fn readable(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(k) = rest.find(|c| c == '[' || c == 'S') {

@@ -813,6 +813,15 @@ pub struct Glass {
     /// `milk:` milky glass, which lifts what is seen through it, the darker the
     /// more, so dark words on it read (0 = none).
     pub milk: Expr,
+    /// `tint:` how much of its own colour is laid over what is seen through
+    /// it (22 %), and more over something bright or busy, so words on it read.
+    pub tint: Expr,
+    /// `vivid:` the saturation of what is seen through it (118 %; 100 % as it is).
+    pub vivid: Expr,
+    /// `mirror:` how much its rim mirrors what is around it (100 %; 0 none).
+    pub mirror: Expr,
+    /// `highlight:` how bright the light caught on its rim is (100 %; 0 none).
+    pub highlight: Expr,
 }
 
 /// A vertical gradient of lightness, so the body is not flat.
@@ -1291,6 +1300,65 @@ pub enum Cursor {
     Move,
     NotAllowed,
     Crosshair,
+    /// Any other of the standard ones, by its place in `CURSOR_NAMES`.
+    Named(u8),
+}
+
+/// The standard cursors by name (CSS's, in the order of Wayland's
+/// cursor-shape protocol): what a theme calls its files, and a program asks for.
+pub const CURSOR_NAMES: &[&str] = &[
+    "default", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text", "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing",
+    "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize", "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "col-resize", "row-resize",
+    "all-scroll", "zoom-in", "zoom-out", "dnd-ask", "all-resize",
+];
+
+const CURSOR_KINDS: [(Cursor, &str); 12] = [
+    (Cursor::Normal, "default"),
+    (Cursor::Hand, "pointer"),
+    (Cursor::Text, "text"),
+    (Cursor::Grab, "grab"),
+    (Cursor::Grabbing, "grabbing"),
+    (Cursor::EwResize, "ew-resize"),
+    (Cursor::NsResize, "ns-resize"),
+    (Cursor::NwseResize, "nwse-resize"),
+    (Cursor::NeswResize, "nesw-resize"),
+    (Cursor::Move, "move"),
+    (Cursor::NotAllowed, "not-allowed"),
+    (Cursor::Crosshair, "crosshair"),
+];
+
+impl Cursor {
+    /// Its standard name (`default`, `pointer`, `ew-resize`…).
+    pub fn name(self) -> &'static str {
+        match self {
+            Cursor::Named(i) => CURSOR_NAMES.get(i as usize).copied().unwrap_or("default"),
+            c => CURSOR_KINDS.iter().find(|k| k.0 == c).map_or("default", |k| k.1),
+        }
+    }
+
+    /// The cursor of that standard name, with `_` or `-` between its words.
+    pub fn from_name(name: &str) -> Option<Cursor> {
+        let name = name.replace('_', "-");
+        if let Some(k) = CURSOR_KINDS.iter().find(|k| k.1 == name) {
+            return Some(k.0);
+        }
+        CURSOR_NAMES.iter().position(|n| *n == name).map(|i| Cursor::Named(i as u8))
+    }
+
+    /// A number for it, to keep in an atomic: the twelve first, then the rest.
+    pub fn code(self) -> u8 {
+        match self {
+            Cursor::Named(i) => 12 + i,
+            c => CURSOR_KINDS.iter().position(|k| k.0 == c).unwrap_or(0) as u8,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Cursor {
+        match CURSOR_KINDS.get(code as usize) {
+            Some(k) => k.0,
+            None => Cursor::Named(code - 12),
+        }
+    }
 }
 
 /// A sensitive region: a shape with a name. The render does the hit-test with
@@ -1848,6 +1916,10 @@ pub struct Scene {
     /// Its own shaders, already checked: `shader aurora = file "aurora.wgsl"`.
     /// Their number is their place here.
     pub shaders: Vec<crate::shaders::UserShader>,
+    /// Its own blur, `blur = file "blur.wgsl" { passes: ... }`, already checked,
+    /// and the numbers it is given (`values:`). Without one, the default.
+    pub blur: Option<crate::blur::Plan>,
+    pub blur_values: Vec<Expr>,
     /// `keyboard: exclusive while open`: when it wants the keyboard.
     pub keyboard_while: Option<Expr>,
     pub permissions: Permissions,
@@ -2648,7 +2720,7 @@ mod tests {
 
     #[test]
     fn constants_fold_on_read() {
-        assert!(matches!((Expr::K(2.0) * 3.0 + 1.0), Expr::K(7.0)));
+        assert!(matches!(Expr::K(2.0) * 3.0 + 1.0, Expr::K(7.0)));
         assert!(matches!(Expr::K(0.0) - Expr::K(4.0), Expr::K(-4.0)));
         assert!(matches!(PropId(0) * 1.0, Expr::P(_)));
         assert!(matches!(PropId(0) + 0.0, Expr::P(_)));
@@ -2704,5 +2776,24 @@ mod tests {
             e = e.mix(Expr::K(k as f32), PropId(0).e().gt(k as f32));
         }
         assert!(e.node_count() < 200, "{} nodes", e.node_count());
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// Every standard name comes back as itself, and so does its number.
+    #[test]
+    fn cursors_go_by_their_names() {
+        for n in CURSOR_NAMES {
+            let c = Cursor::from_name(n).unwrap();
+            assert_eq!(c.name(), *n);
+            assert_eq!(Cursor::from_code(c.code()), c);
+        }
+        assert_eq!(Cursor::from_name("ew_resize"), Some(Cursor::EwResize));
+        assert_eq!(Cursor::from_name("pointer"), Some(Cursor::Hand));
+        assert_eq!(Cursor::from_name("zoom_in").map(Cursor::name), Some("zoom-in"));
+        assert_eq!(Cursor::from_name("bogus"), None);
     }
 }

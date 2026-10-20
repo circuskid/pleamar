@@ -34,11 +34,18 @@ struct Bounds {
 };
 @group(0) @binding(4) var<uniform> bounds: Bounds;
 
-@fragment
-fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(e.pos.xy);
+// What is unmixed at a pixel, and whether it says that the capture is not of
+// this canvas: under our opaque parts the capture should be ours, and nowhere
+// should what is behind come out as a colour that cannot be.
+struct Unmixed {
+    value: vec4<f32>,
+    wrong: bool,
+};
+
+fn unmix_at(pos: vec2<f32>) -> Unmixed {
+    let px = vec2<i32>(pos);
     // The compositor takes the capture at its own scale: it is read proportionally.
-    let f = textureSampleLevel(capture, linear_sampler, (e.pos.xy - bounds.rect.xy) / bounds.rect.zw, 0.0).rgb;
+    let f = textureSampleLevel(capture, linear_sampler, (pos - bounds.rect.xy) / bounds.rect.zw, 0.0).rgb;
     // Ours, as the compositor blended it: times its opacity.
     let s = textureLoad(canvas, px, 0) * bounds.opacity;
     let a = textureLoad(previous, px, 0);
@@ -47,7 +54,7 @@ fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
     // marked as unknown (alpha 0), and the frosting fills it with what is
     // around. Keeping the last one seen left it stale forever.
     if (remaining < 0.03) {
-        return vec4<f32>(0.0);
+        return Unmixed(vec4<f32>(0.0), any(abs(f - s.rgb) > vec3<f32>(0.1)));
     }
     let background = (f - s.rgb) / remaining;
     // A background that cannot be: the capture is not of this canvas. With a
@@ -55,9 +62,14 @@ fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
     // level over what remains.
     let margin = 0.03 + 0.5 / 255.0 / remaining;
     if (any(background < vec3<f32>(-margin)) || any(background > vec3<f32>(1.0 + margin))) {
-        return a;
+        return Unmixed(a, true);
     }
-    return vec4<f32>(clamp(background, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return Unmixed(vec4<f32>(clamp(background, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0), false);
+}
+
+@fragment
+fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
+    return unmix_at(e.pos.xy).value;
 }
 
 // ── own ───────────────────────────────────────────────────────────
@@ -79,33 +91,3 @@ fn own_over(e: VertexOut) -> @location(0) vec4<f32> {
     return ours + (1.0 - ours.a) * vec4<f32>(behind.rgb * behind.a, behind.a);
 }
 
-// ── blur ──────────────────────────────────────────────────────────
-// Separable gaussian: one pass horizontally and another vertically, at half
-// resolution (the frosting needs no more, and it costs a quarter). It is read
-// proportionally, so the first pass, from full resolution to half, also
-// downscales. What is unknown has alpha 0 and weighs nothing: the result is in
-// premultiplied alpha, and whoever reads it divides by the alpha.
-struct Blur {
-    direction: vec2<f32>, // (1, 0) or (0, 1), in pixels of the destination
-    sigma: f32,           // in pixels of the destination
-    _r: f32,
-    dest_size: vec2<f32>, // the size of the destination, in pixels
-    _s: vec2<f32>,
-};
-@group(0) @binding(0) var source: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> b: Blur;
-@group(0) @binding(2) var soft_sampler: sampler;
-
-@fragment
-fn blur(e: VertexOut) -> @location(0) vec4<f32> {
-    let radius = i32(ceil(b.sigma * 2.5));
-    var total = vec4<f32>(0.0);
-    var weight = 0.0;
-    for (var k = -radius; k <= radius; k++) {
-        let w = exp(-f32(k * k) / (2.0 * b.sigma * b.sigma));
-        let q = (e.pos.xy + b.direction * f32(k)) / b.dest_size;
-        total += textureSampleLevel(source, soft_sampler, q, 0.0) * w;
-        weight += w;
-    }
-    return total / weight;
-}

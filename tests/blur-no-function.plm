@@ -1,0 +1,5 @@
+// expect: error «there is no `fn sideways(s: Blur) -> vec4<f32>`»
+scene BlurNoFunction {
+    surface { size: 100, 100 }
+    blur = file "shaders/blur.wgsl" { passes: down 0.5, sideways 1 }
+}

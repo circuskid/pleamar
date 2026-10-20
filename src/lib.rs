@@ -12,6 +12,7 @@ pub mod scene;
 mod scenes;
 mod skill;
 mod shaders;
+mod blur;
 mod shapes;
 mod lsp;
 mod luau_types;
@@ -532,6 +533,8 @@ pub fn run_with(options: Vec<String>) {
             quit_after_render(&tx);
         });
     }
+    #[cfg(unix)]
+    quit_on_signals(to_render.clone());
 
     // From here on this thread belongs to the platform: it puts up the windows and attends
     // to the system until someone closes.
@@ -566,6 +569,44 @@ fn quit() -> ! {
     #[cfg(feature = "luau")]
     logic_luau::stop_children();
     std::process::exit(0)
+}
+
+/// `kill` (SIGTERM), Ctrl+C at its terminal (SIGINT) or that terminal going
+/// away (SIGHUP): out the same way as `--say … quit`, through the render and
+/// stopping what the logic started, which a plain kill left running. A second
+/// one while it is on its way out ends it at once.
+#[cfg(unix)]
+fn quit_on_signals(tx: std::sync::mpsc::Sender<ToRender>) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static PIPE: AtomicI32 = AtomicI32::new(-1);
+    static HEARD: AtomicBool = AtomicBool::new(false);
+    // Only what a signal handler may do: a byte into a pipe, or leave.
+    extern "C" fn heard(_: libc::c_int) {
+        if HEARD.swap(true, Ordering::SeqCst) {
+            // SAFETY: _exit is async-signal-safe.
+            unsafe { libc::_exit(1) }
+        }
+        let fd = PIPE.load(Ordering::SeqCst);
+        let byte = 1u8;
+        // SAFETY: write is async-signal-safe, and the pipe lives as long as the process.
+        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    }
+    let mut fds = [0; 2];
+    // SAFETY: two descriptors for the call to fill.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return;
+    }
+    PIPE.store(fds[1], Ordering::SeqCst);
+    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || {
+        let mut byte = 0u8;
+        // SAFETY: reading one byte from our own pipe.
+        while unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) } < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {}
+        quit_after_render(&tx);
+    });
+    for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: a handler that only does what a handler may.
+        unsafe { libc::signal(s, heard as *const () as libc::sighandler_t) };
+    }
 }
 
 /// Whether the render has finished: nothing of it touches the card any more.

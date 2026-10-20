@@ -16,12 +16,14 @@
 
 use crate::platform::Backdrop;
 
-/// How much what is behind gets frosted, in logical pixels.
-const FROST: f32 = 8.0;
+// How what is behind gets frosted is the scene's: see `blur.rs`.
 
 pub struct Pipelines {
     unmix: wgpu::RenderPipeline,
-    blur: wgpu::RenderPipeline,
+    /// Unmixing into a draft while counting what says the capture is of
+    /// another frame, and keeping the draft only if almost nothing did
+    /// (`backdrop_check.wgsl`); none where a fragment cannot count (OpenGL).
+    checked: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     own: wgpu::RenderPipeline,
     own_over: wgpu::RenderPipeline,
     linear: wgpu::Sampler,
@@ -30,7 +32,7 @@ pub struct Pipelines {
 impl Pipelines {
     pub fn new(d: &wgpu::Device) -> Pipelines {
         let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("backdrop"), source: wgpu::ShaderSource::Wgsl(include_str!("backdrop.wgsl").into()) });
-        let pipeline = |fs: &str| {
+        let pipeline_to = |fs: &str, format: wgpu::TextureFormat| {
             d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: None,
@@ -42,12 +44,13 @@ impl Pipelines {
                     module: &module,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
+        let pipeline = |fs: &str| pipeline_to(fs, wgpu::TextureFormat::Rgba8Unorm);
         let linear = d.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -55,7 +58,45 @@ impl Pipelines {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        Pipelines { unmix: pipeline("unmix"), blur: pipeline("blur"), own: pipeline("own"), own_over: pipeline("own_over"), linear }
+        // The same file and the counting, as one module: only where it builds.
+        let checked = {
+            let scope = d.push_error_scope(wgpu::ErrorFilter::Validation);
+            let source = format!("{}{}", include_str!("backdrop.wgsl"), include_str!("backdrop_check.wgsl"));
+            let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("backdrop, checked"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+            let make = |fs: &str| {
+                d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(fs),
+                    layout: None,
+                    vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some(fs),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let both = (make("unmix_checked"), make("settle"));
+            match pollster::block_on(scope.pop()) {
+                None => Some(both),
+                Some(e) => {
+                    eprintln!("render · the glass unmixes each capture without checking it is of the frame it was taken with ({e})");
+                    None
+                }
+            }
+        };
+        Pipelines {
+            unmix: pipeline("unmix"),
+            checked,
+            own: pipeline("own"),
+            own_over: pipeline("own_over"),
+            linear,
+        }
     }
 }
 
@@ -99,9 +140,12 @@ pub struct Lens {
     /// it cannot be unmixed.
     backgrounds: [(wgpu::Texture, wgpu::TextureView); 2],
     current: usize,
-    half: (wgpu::Texture, wgpu::TextureView),
-    blurred: (wgpu::Texture, wgpu::TextureView),
-    blur_uniforms: [wgpu::Buffer; 2],
+    /// What a capture unmixes to before it is known to be of the right frame,
+    /// and how many pixels were looked at and how many said it is not
+    /// (`Pipelines::checked`).
+    draft: (wgpu::Texture, wgpu::TextureView),
+    verdict: wgpu::Buffer,
+    frost: Frost,
     /// A sample of the last capture, and of which box it was: so as not to
     /// repeat the work if nothing has changed.
     sample: Vec<u8>,
@@ -120,12 +164,15 @@ pub struct Lens {
 }
 
 impl Lens {
-    pub fn new(d: &wgpu::Device, format: wgpu::TextureFormat, px: (u32, u32)) -> Lens {
+    /// The blur plan its frosting was made for.
+    pub fn blur_generation(&self) -> u64 {
+        self.frost.generation
+    }
+
+    pub fn new(d: &wgpu::Device, format: wgpu::TextureFormat, px: (u32, u32), b: &crate::blur::Built) -> Lens {
         use wgpu::TextureUsages as U;
         let canvas = || texture(d, "canvas", px, format, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING | U::COPY_SRC);
         let background = || texture(d, "background", px, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING | U::COPY_SRC | U::COPY_DST);
-        let half = (px.0.div_ceil(2), px.1.div_ceil(2));
-        let uniforms = || d.create_buffer(&wgpu::BufferDescriptor { label: Some("blur"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         Lens {
             px,
             canvases: [canvas(), canvas()],
@@ -134,9 +181,9 @@ impl Lens {
             capture: None,
             backgrounds: [background(), background()],
             current: 0,
-            half: texture(d, "half", half, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
-            blurred: texture(d, "blurred", half, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
-            blur_uniforms: [uniforms(), uniforms()],
+            draft: texture(d, "draft", px, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
+            verdict: d.create_buffer(&wgpu::BufferDescriptor { label: Some("verdict"), size: 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            frost: Frost::new(d, px, b),
             sample: Vec::new(),
             pending: None,
             bounds: [0; 4],
@@ -223,7 +270,7 @@ impl Lens {
         // a third of a millisecond per capture.
         self.pending = Some((presented, scissor));
         let new = self.current ^ 1;
-        self.group = Some(g.backdrop_group(&self.backgrounds[new].1, &self.blurred.1));
+        self.group = Some(g.backdrop_group(&self.backgrounds[new].1, self.frost.result()));
         self.ready = true;
         true
     }
@@ -248,19 +295,38 @@ impl Lens {
         // out as a copy of the current one, and only the inside is written.
         let new = self.current ^ 1;
         enc.copy_texture_to_texture(self.backgrounds[self.current].0.as_image_copy(), self.backgrounds[new].0.as_image_copy(), wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 });
-        let unmix_group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &t.unmix.get_bind_group_layout(0),
-            entries: &[
+        let unmixing = |layout: &wgpu::BindGroupLayout, verdict: Option<&wgpu::Buffer>| {
+            let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&capture.1) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.canvases[presented].1) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.backgrounds[self.current].1) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&t.linear) },
                 wgpu::BindGroupEntry { binding: 4, resource: self.bounds_uniforms.as_entire_binding() },
-            ],
-        });
-        pass(enc, &t.unmix, &self.backgrounds[new].1, &unmix_group, scissor);
-        frost(g, t, enc, &self.backgrounds[new].1, &self.half, &self.blurred, &self.blur_uniforms, scissor, scale);
+            ];
+            if let Some(v) = verdict {
+                entries.push(wgpu::BindGroupEntry { binding: 5, resource: v.as_entire_binding() });
+            }
+            dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
+        };
+        match &t.checked {
+            // Into the draft, counting; then into the new background, or what was there.
+            Some((check, settle)) => {
+                enc.clear_buffer(&self.verdict, 0, None);
+                pass(enc, check, &self.draft.1, &unmixing(&check.get_bind_group_layout(0), Some(&self.verdict)), scissor);
+                let settle_group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &settle.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.draft.1) },
+                        wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.backgrounds[self.current].1) },
+                        wgpu::BindGroupEntry { binding: 8, resource: self.verdict.as_entire_binding() },
+                    ],
+                });
+                pass(enc, settle, &self.backgrounds[new].1, &settle_group, scissor);
+            }
+            None => pass(enc, &t.unmix, &self.backgrounds[new].1, &unmixing(&t.unmix.get_bind_group_layout(0), None), scissor),
+        }
+        self.frost.run(g, enc, &self.backgrounds[new].1, scissor, scale);
         self.current = new;
     }
 }
@@ -286,36 +352,82 @@ fn pass(enc: &mut wgpu::CommandEncoder, pipeline: &wgpu::RenderPipeline, target:
     p.draw(0..3, 0..1);
 }
 
-/// Frosts the sharp background in `scissor` (real pixels), at half
-/// resolution: horizontal into `half`, vertical into `blurred`.
-#[allow(clippy::too_many_arguments)]
-fn frost(g: &crate::gpu::Gpu, t: &Pipelines, enc: &mut wgpu::CommandEncoder, sharp: &wgpu::TextureView, half: &(wgpu::Texture, wgpu::TextureView), blurred: &(wgpu::Texture, wgpu::TextureView), uniforms: &[wgpu::Buffer; 2], scissor: (u32, u32, u32, u32), scale: f32) {
-    let dev = &g.device;
-    let (mw, mh) = (half.0.width(), half.0.height());
-    let sigma = FROST * scale * 0.5;
-    for (k, step) in [[1.0f32, 0.0], [0.0, 1.0]].iter().enumerate() {
-        g.queue.write_buffer(&uniforms[k], 0, bytemuck::cast_slice(&[step[0], step[1], sigma, 0.0, mw as f32, mh as f32, 0.0, 0.0]));
+/// The frosting's pictures, one per pass of the scene's blur (`blur.rs`),
+/// sized for it; the last is what the shapes shader reads.
+struct Frost {
+    levels: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    uniforms: Vec<wgpu::Buffer>,
+    /// The plan it was made for: one made for another is made again.
+    generation: u64,
+}
+
+impl Frost {
+    fn new(d: &wgpu::Device, px: (u32, u32), b: &crate::blur::Built) -> Frost {
+        use wgpu::TextureUsages as U;
+        let mut size = (px.0 as f32, px.1 as f32);
+        let mut levels = Vec::new();
+        for step in &b.plan.steps {
+            size = (size.0 * step.scale, size.1 * step.scale);
+            let px = ((size.0.ceil() as u32).clamp(1, 8192), (size.1.ceil() as u32).clamp(1, 8192));
+            levels.push(texture(d, "frost", px, crate::blur::FORMAT, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING));
+        }
+        let uniforms = b.plan.steps.iter().map(|_| d.create_buffer(&wgpu::BufferDescriptor { label: Some("frost"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })).collect();
+        Frost { levels, uniforms, generation: b.generation }
     }
-    let blur = |source: &wgpu::TextureView, u: &wgpu::Buffer| {
-        dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &t.blur.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
-                wgpu::BindGroupEntry { binding: 1, resource: u.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&t.linear) },
-            ],
-        })
-    };
-    // The clip, halved, and with the margin the gaussian reaches.
-    let m = (sigma * 2.5).ceil() as u32 + 1;
-    let x0 = (scissor.0 / 2).saturating_sub(m);
-    let y0 = (scissor.1 / 2).saturating_sub(m);
-    let x1 = ((scissor.0 + scissor.2).div_ceil(2) + m).min(mw);
-    let y1 = ((scissor.1 + scissor.3).div_ceil(2) + m).min(mh);
-    let half_clip = (x0, y0, x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1));
-    pass(enc, &t.blur, &half.1, &blur(sharp, &uniforms[0]), half_clip);
-    pass(enc, &t.blur, &blurred.1, &blur(&half.1, &uniforms[1]), half_clip);
+
+    fn result(&self) -> &wgpu::TextureView {
+        &self.levels[self.levels.len() - 1].1
+    }
+
+    /// Frosts the sharp background in `scissor` (real pixels) through the
+    /// blur's passes. Every pass is clipped to the scissor at its size, with
+    /// the reach of the frosting around it.
+    fn run(&self, g: &crate::gpu::Gpu, enc: &mut wgpu::CommandEncoder, sharp: &wgpu::TextureView, scissor: (u32, u32, u32, u32), scale: f32) {
+        let b = g.blur();
+        if b.generation != self.generation {
+            return;
+        }
+        let dev = &g.device;
+        let values = g.blur_values;
+        let full = (sharp.texture().width() as f32, sharp.texture().height() as f32);
+        let reach = b.plan.reach * scale.max(1.0);
+        // The pictures kept for later passes, by slot; an unused one reads the backdrop.
+        let mut kept: [&wgpu::TextureView; 4] = [sharp; 4];
+        let mut prev = sharp;
+        let mut prev_size = full;
+        for (k, step) in b.plan.steps.iter().enumerate() {
+            let (w, h) = (self.levels[k].0.width(), self.levels[k].0.height());
+            let f = w as f32 / full.0;
+            let m = (reach * f).ceil() as u32 + 2;
+            let x0 = ((scissor.0 as f32 * f) as u32).saturating_sub(m);
+            let y0 = ((scissor.1 as f32 * f) as u32).saturating_sub(m);
+            let x1 = (((scissor.0 + scissor.2) as f32 * f).ceil() as u32 + m).min(w);
+            let y1 = (((scissor.1 + scissor.3) as f32 * f).ceil() as u32 + m).min(h);
+            let clip = (x0.min(w.saturating_sub(1)), y0.min(h.saturating_sub(1)), x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1));
+            let u = [w as f32, h as f32, prev_size.0, prev_size.1, scale, step.index as f32, step.count as f32, k as f32, values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]];
+            g.queue.write_buffer(&self.uniforms[k], 0, bytemuck::cast_slice(&u));
+            let group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &b.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(prev) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(sharp) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(kept[0]) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(kept[1]) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(kept[2]) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(kept[3]) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&g.blur_sampler) },
+                    wgpu::BindGroupEntry { binding: 7, resource: self.uniforms[k].as_entire_binding() },
+                ],
+            });
+            pass(enc, b.pipeline(&step.entry), &self.levels[k].1, &group, clip);
+            if let Some(slot) = step.keep {
+                kept[slot as usize] = &self.levels[k].1;
+            }
+            prev = &self.levels[k].1;
+            prev_size = (w as f32, h as f32);
+        }
+    }
 }
 
 /// The lens of a scene that is the whole screen —pleamar-wm's—: there is no
@@ -330,23 +442,24 @@ fn frost(g: &crate::gpu::Gpu, t: &Pipelines, enc: &mut wgpu::CommandEncoder, sha
 pub struct Own {
     pub px: (u32, u32),
     sharp: (wgpu::Texture, wgpu::TextureView),
-    half: (wgpu::Texture, wgpu::TextureView),
-    blurred: (wgpu::Texture, wgpu::TextureView),
-    blur_uniforms: [wgpu::Buffer; 2],
+    frost: Frost,
     /// What the shapes shader reads.
     pub group: wgpu::BindGroup,
 }
 
 impl Own {
+    /// The blur plan its frosting was made for.
+    pub fn blur_generation(&self) -> u64 {
+        self.frost.generation
+    }
+
     pub fn new(g: &crate::gpu::Gpu, px: (u32, u32)) -> Own {
         use wgpu::TextureUsages as U;
         let d = &g.device;
-        let half = (px.0.div_ceil(2), px.1.div_ceil(2));
-        let uniforms = || d.create_buffer(&wgpu::BufferDescriptor { label: Some("blur"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let sharp = texture(d, "painted below the glass", px, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING);
-        let blurred = texture(d, "blurred", half, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING);
-        let group = g.backdrop_group(&sharp.1, &blurred.1);
-        Own { px, sharp, half: texture(d, "half", half, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING), blurred, blur_uniforms: [uniforms(), uniforms()], group }
+        let frost = Frost::new(d, px, g.blur());
+        let group = g.backdrop_group(&sharp.1, frost.result());
+        Own { px, sharp, frost, group }
     }
 
     /// What has been painted so far in `painted`, in `scissor` (real pixels),
@@ -360,12 +473,15 @@ impl Own {
         }
         let group = g.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &entries });
         pass(enc, pipeline, &self.sharp.1, &group, scissor);
-        frost(g, t, enc, &self.sharp.1, &self.half, &self.blurred, &self.blur_uniforms, scissor, scale);
+        self.frost.run(g, enc, &self.sharp.1, scissor, scale);
     }
 }
 
 /// At most, one capture of what is behind every so often while painting.
 pub const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// How much margin the frosting needs around a glass, in logical pixels.
-pub const MARGIN: f32 = FROST * 2.5 + 2.0;
+/// How much margin the frosting needs around a glass, in logical pixels:
+/// the reach of the scene's blur.
+pub fn margin() -> f32 {
+    crate::blur::reach() + 2.0
+}

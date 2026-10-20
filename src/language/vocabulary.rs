@@ -6,7 +6,7 @@
 
 /// What a statement can start with (besides the name of a component).
 pub const STATEMENTS: &[&str] = &[
-    "surface", "permissions", "model", "service", "spring", "prop", "pose", "fact", "event", "text", "image", "figure", "font", "shader", "particles", "measure", "let", "zone",
+    "surface", "permissions", "model", "service", "spring", "prop", "pose", "fact", "event", "text", "image", "figure", "font", "shader", "blur", "particles", "measure", "let", "zone",
     "body", "ellipse", "box", "arc", "line", "path", "input", "clip", "group", "popup",
     "component", "children", "repeat", "for", "row", "column", "grid", "pages", "space", "between",
     "layer", "on", "every", "blink", "wave", "spin", "follow", "look", "gesture", "posture",
@@ -20,13 +20,14 @@ pub const LIBRARY_STATEMENTS: &[&str] = &["let", "spring", "component", "permiss
 pub const PROPERTIES: &[(&str, &[&str])] = &[
     ("surface", &["size", "anchor", "margin", "level", "reserve", "screens", "keyboard", "open", "kind", "title", "app_id", "rate", "captures", "agent"]),
     ("permissions", &["run", "services"]),
-    ("shape", &["rotate", "stroke", "color", "opacity", "blend", "glass", "lens", "shine", "refraction", "dispersion", "dome", "ripple", "frost", "smoke", "milk", "active", "show", "cursor", "carries", "carry_icon", "grow", "label", "agent", "role", "value", "checked", "selected", "handle"]),
+    ("blur", &["passes", "values", "reach"]),
+    ("shape", &["rotate", "stroke", "color", "opacity", "blend", "glass", "lens", "shine", "refraction", "dispersion", "dome", "ripple", "frost", "smoke", "milk", "tint", "vivid", "mirror", "highlight", "active", "show", "cursor", "carries", "carry_icon", "grow", "label", "agent", "role", "value", "checked", "selected", "handle"]),
     ("ellipse", &["at", "radius", "scale"]),
     ("box", &["at", "from", "size", "corner"]),
     ("arc", &["at", "radius", "span", "width"]),
     ("line", &["from", "to", "width"]),
     ("path", &["at", "size"]),
-    ("body", &["color", "gradient", "rim", "light", "shadow", "border", "glass", "lens", "shine", "refraction", "dispersion", "dome", "ripple", "frost", "smoke", "milk", "opacity", "show"]),
+    ("body", &["color", "gradient", "rim", "light", "shadow", "border", "glass", "lens", "shine", "refraction", "dispersion", "dome", "ripple", "frost", "smoke", "milk", "tint", "vivid", "mirror", "highlight", "opacity", "show"]),
     ("text", &["at", "anchor", "width", "size", "weight", "color", "opacity", "lines", "align", "line_height", "family", "measure", "show", "grow", "gradient", "outline", "shadow", "letter_move", "letter_opacity", "letter_scale", "selectable", "selection", "markdown"]),
     ("image", &["at", "size", "opacity", "tint", "cell", "show", "grow"]),
     ("window", &["at", "size", "ask", "opacity", "show"]),
@@ -38,7 +39,7 @@ pub const PROPERTIES: &[(&str, &[&str])] = &[
     ("popup", &["at", "size", "open"]),
     ("children", &["move"]),
     ("grid", &["at", "columns", "gap", "width", "row", "show", "opacity"]),
-    ("layout", &["at", "anchor", "gap", "padding", "align", "fill", "glass", "lens", "shine", "refraction", "dispersion", "dome", "ripple", "frost", "smoke", "milk", "corner", "show", "opacity", "cursor", "view", "step", "content", "wrap", "size", "grow"]),
+    ("layout", &["at", "anchor", "gap", "padding", "align", "fill", "glass", "lens", "shine", "refraction", "dispersion", "dome", "ripple", "frost", "smoke", "milk", "tint", "vivid", "mirror", "highlight", "corner", "show", "opacity", "cursor", "view", "step", "content", "wrap", "size", "grow"]),
 ];
 
 pub const FUNCTIONS: &[&str] = &["min", "max", "abs", "floor", "ceil", "sin", "cos", "clamp", "smooth", "mix", "if", "vel", "sqrt", "pow", "fract", "mod", "sign", "round", "exp", "log", "tan", "atan2", "length", "noise", "random", "pick", "rgb"];
@@ -75,6 +76,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("font", "`font file \"fonts/pixel.ttf\"` — a font the scene brings with it: `family:` names it as if it were installed, and nothing is put in the system."),
     ("particles", "`particles { at: 200, 100; count: 300; life: 0.6s .. 1.4s; speed: 40 .. 160; direction: -90deg; spread: 60deg; gravity: 0, 120; size: 5, 0; colors: mint, #fff; emit: open }` — an emitter. Each particle is worked out on the card from its number and the time, so thousands cost what their pixels cost. `burst: event` lets them all out at once instead."),
     ("shader", "Declares one of the scene's own shaders (`shader aurora = file \"aurora.wgsl\"`, with `fn shade(s: Shader) -> vec4<f32>`) or paints a box with it (`shader aurora { at: 360, 60; size: 400, 120; values: glow; colors: mint }`)."),
+    ("blur", "The frosting behind every glass of the scene, as passes of its own: `blur = file \"blur.wgsl\" { passes: down 0.5 repeat 4, up 2 repeat 3, grade 1; values: 1.5, 0.02; reach: 34 }`, each pass a `fn down(s: Blur) -> vec4<f32>` reading `prev`, `input` and `kept`."),
     ("measure", "`measure label` — creates `label.width` and `label.height`, filled by the text that carries `measure: label`."),
     ("let", "`let panel.x = orb.x + 62` — a name for an expression, or for a colour. It has to come before whoever uses it."),
     ("zone", "`zone box whole { at: …; size: … }` — a shape that is not painted: it only catches the mouse."),
@@ -127,12 +129,13 @@ pub const SERVICES: &[(&str, &[&str])] = &[
     ("clock", &["hour", "minute", "second", "day", "month", "year", "weekday", "time", "date"]),
     ("clock.seconds", &["hour", "minute", "second", "day", "month", "year", "weekday", "time", "date"]),
     ("audio", &["volume", "muted", "input", "input_muted", "outputs", "inputs", "apps"]),
+    ("audio.level", &["level"]),
     ("battery", &["present", "percent", "charging"]),
     ("brightness", &["present", "level"]),
     ("network", &["online", "kind", "name", "strength", "wifi", "error", "networks"]),
     ("bluetooth", &["present", "powered", "discovering", "devices", "pairing", "pairing_address", "pairing_name", "pairing_code"]),
-    ("media", &["playing", "title", "artist", "album", "length", "position", "rate", "art", "player", "players"]),
-    ("window", &["title", "class", "monitor", "list"]),
+    ("media", &["playing", "title", "artist", "album", "length", "position", "rate", "can_seek", "art", "player", "players"]),
+    ("window", &["title", "class", "monitor", "fullscreen", "maximized", "list"]),
     ("thumbnails", &["list", "capturing"]),
     ("workspaces", &["active", "list"]),
     ("apps", &["list"]),
@@ -155,7 +158,11 @@ pub const MODEL_TYPES: &[&str] = &["list"];
 pub const PARAMETER_TYPES: &[&str] = &["number", "bool", "color", "text", "record", "event", "image", "gesture", "spring"];
 pub const SPRINGS: &[&str] = &["lively", "calm", "quick", "slow", "gentle", "pose"];
 pub const UNITS: &[&str] = &["px", "%", "deg", "ms", "s"];
-pub const CURSORS: &[&str] = &["default", "pointer", "text", "grab", "grabbing", "ew_resize", "ns_resize", "nwse_resize", "nesw_resize", "move", "not_allowed", "crosshair"];
+pub const CURSORS: &[&str] = &[
+    "default", "pointer", "text", "grab", "grabbing", "ew_resize", "ns_resize", "nwse_resize", "nesw_resize", "move", "not_allowed", "crosshair", "context_menu", "help", "progress", "wait", "cell",
+    "vertical_text", "alias", "copy", "no_drop", "e_resize", "n_resize", "ne_resize", "nw_resize", "s_resize", "se_resize", "sw_resize", "w_resize", "col_resize", "row_resize", "all_scroll", "zoom_in",
+    "zoom_out", "dnd_ask", "all_resize",
+];
 pub const SURFACE_ANCHORS: &[&str] = &["top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right", "center"];
 pub const LEVELS: &[&str] = &["background", "bottom", "top", "overlay"];
 /// Which kind of window a surface asks for: stuck to an edge, or a normal one.

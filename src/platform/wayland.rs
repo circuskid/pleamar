@@ -707,7 +707,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn cursor(&self, c: Cursor) {
         let shape = shape_of(c);
-        CURSOR_SHAPE.store(c as u8, Ordering::Relaxed);
+        CURSOR_SHAPE.store(c.code(), Ordering::Relaxed);
         if let Some(d) = self.cursors.lock().unwrap().as_ref() {
             d.set_shape(self.serial.load(Ordering::Relaxed), shape);
         }
@@ -734,6 +734,8 @@ fn shape_of(c: Cursor) -> Shape {
         Cursor::Move => Shape::Move,
         Cursor::NotAllowed => Shape::NotAllowed,
         Cursor::Crosshair => Shape::Crosshair,
+        // the protocol numbers its shapes in the order of the names, from 1
+        Cursor::Named(i) => Shape::try_from(i as u32 + 1).unwrap_or(Shape::Default),
     }
 }
 
@@ -1822,20 +1824,7 @@ impl PointerHandler for State {
                     if let PointerEventKind::Enter { serial } = e.kind {
                         self.serial.store(serial, Ordering::Relaxed);
                         if let Some(d) = self.cursors.lock().unwrap().as_ref() {
-                            let c = match CURSOR_SHAPE.load(Ordering::Relaxed) {
-                                1 => Cursor::Hand,
-                                2 => Cursor::Text,
-                                3 => Cursor::Grab,
-                                4 => Cursor::Grabbing,
-                                5 => Cursor::EwResize,
-                                6 => Cursor::NsResize,
-                                7 => Cursor::NwseResize,
-                                8 => Cursor::NeswResize,
-                                9 => Cursor::Move,
-                                10 => Cursor::NotAllowed,
-                                11 => Cursor::Crosshair,
-                                _ => Cursor::Normal,
-                            };
+                            let c = Cursor::from_code(CURSOR_SHAPE.load(Ordering::Relaxed));
                             d.set_shape(serial, shape_of(c));
                         }
                     }
@@ -2239,30 +2228,168 @@ impl ProvidesRegistryState for State {
 
 smithay_client_toolkit::delegate_dispatch2!(State);
 
-/// An icon by its name, the freedesktop way but without reading the
-/// `index.theme` files: it tries the usual themes, from vector down to
-/// small. Good enough for application icons.
+/// An icon by its name, the freedesktop way: the user's GTK icon theme and
+/// the ones it inherits, then hicolor and a few common ones, in every icon
+/// folder of `XDG_DATA_HOME` and `XDG_DATA_DIRS`, each theme's folders as
+/// its `index.theme` lists them, from vector down to small.
 pub fn icon(name: &str) -> Option<std::path::PathBuf> {
+    static DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let dirs = DIRS.get_or_init(icon_dirs);
+    dirs.iter()
+        .flat_map(|d| ["svg", "png"].map(|e| d.join(format!("{name}.{e}"))))
+        .find(|p| p.is_file())
+}
+
+fn icon_dirs() -> Vec<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let bases = [format!("{home}/.local/share/icons"), format!("{home}/.icons"), "/usr/share/icons".into()];
-    let themes = ["hicolor", "Papirus", "Papirus-Dark", "Adwaita", "breeze", "breeze-dark"];
-    let sizes = ["scalable", "512x512", "256x256", "128x128", "96x96", "64x64", "48x48", "32x32", "symbolic"];
-    let contexts = ["apps", "devices", "places", "status", "actions", "categories", "mimetypes"];
-    for base in &bases {
-        for theme in themes {
-            for size in sizes {
-                for context in contexts {
-                    for ext in ["svg", "png"] {
-                        // Some themes order by size/context and others by context/size.
-                        for path in [format!("{base}/{theme}/{size}/{context}/{name}.{ext}"), format!("{base}/{theme}/{context}/{size}/{name}.{ext}")] {
-                            if std::path::Path::new(&path).is_file() {
-                                return Some(path.into());
-                            }
-                        }
+    let data_home = std::env::var("XDG_DATA_HOME").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| format!("{home}/.local/share"));
+    let data_dirs = std::env::var("XDG_DATA_DIRS").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    let config = std::env::var("XDG_CONFIG_HOME").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| format!("{home}/.config"));
+    icon_dirs_in(&home, &data_home, &data_dirs, &config)
+}
+
+/// The same, from where the home, the data folders and the settings are.
+fn icon_dirs_in(home: &str, data_home: &str, data_dirs: &str, config: &str) -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let mut shares = vec![PathBuf::from(data_home)];
+    shares.extend(data_dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
+    shares.push("/usr/share".into());
+    // A folder listed twice is looked at once, where it came first.
+    let mut seen = std::collections::HashSet::new();
+    shares.retain(|s| seen.insert(s.clone()));
+    let mut bases = vec![PathBuf::from(data_home).join("icons"), PathBuf::from(format!("{home}/.icons"))];
+    bases.extend(shares.iter().map(|s| s.join("icons")));
+    let mut seen = std::collections::HashSet::new();
+    bases.retain(|b| seen.insert(b.clone()));
+    let index = |theme: &str| bases.iter().map(|b| b.join(theme).join("index.theme")).find(|p| p.is_file()).and_then(|p| std::fs::read_to_string(p).ok());
+    let key = |text: &str, section: &str, key: &str| -> Option<String> {
+        let mut inside = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                inside = line == format!("[{section}]");
+            } else if inside {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k.trim() == key {
+                        return Some(v.trim().to_owned());
                     }
                 }
             }
         }
+        None
+    };
+
+    // The theme GTK is set to, then what it inherits, then the fallbacks.
+    let user = ["gtk-4.0", "gtk-3.0"].iter()
+        .filter_map(|g| std::fs::read_to_string(format!("{config}/{g}/settings.ini")).ok())
+        .find_map(|t| key(&t, "Settings", "gtk-icon-theme-name"));
+    let mut themes: Vec<String> = Vec::new();
+    let mut queue: Vec<String> = user.into_iter().collect();
+    while let Some(theme) = queue.pop() {
+        if themes.contains(&theme) {
+            continue;
+        }
+        let parents = index(&theme).and_then(|t| key(&t, "Icon Theme", "Inherits")).unwrap_or_default();
+        themes.push(theme);
+        queue.extend(parents.split(',').map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()).rev());
     }
-    ["svg", "png"].iter().map(|e| std::path::PathBuf::from(format!("/usr/share/pixmaps/{name}.{e}"))).find(|p| p.is_file())
+    for theme in ["hicolor", "Papirus", "Papirus-Dark", "Adwaita", "breeze", "breeze-dark"] {
+        if !themes.iter().any(|t| t == theme) {
+            themes.push(theme.into());
+        }
+    }
+
+    let mut dirs = Vec::new();
+    for theme in &themes {
+        // Scalable first, then the largest.
+        let subdirs: Vec<String> = match index(theme) {
+            Some(text) => {
+                let mut listed: Vec<(bool, u32, String)> = key(&text, "Icon Theme", "Directories").unwrap_or_default()
+                    .split(',').map(str::trim).filter(|d| !d.is_empty())
+                    .map(|d| {
+                        let scalable = key(&text, d, "Type").is_some_and(|t| t == "Scalable");
+                        let size = key(&text, d, "Size").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        (scalable, size, d.to_owned())
+                    })
+                    .collect();
+                listed.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+                listed.into_iter().map(|(_, _, d)| d).collect()
+            }
+            None => {
+                let sizes = ["scalable", "512x512", "256x256", "128x128", "96x96", "64x64", "48x48", "32x32", "symbolic"];
+                let contexts = ["apps", "devices", "places", "status", "actions", "categories", "mimetypes"];
+                // Some themes order by size/context and others by context/size.
+                sizes.iter().flat_map(|s| contexts.iter().flat_map(move |c| [format!("{s}/{c}"), format!("{c}/{s}")])).collect()
+            }
+        };
+        for base in &bases {
+            let root = base.join(theme);
+            if root.is_dir() {
+                dirs.extend(subdirs.iter().map(|d| root.join(d)).filter(|d| d.is_dir()));
+            }
+        }
+    }
+    dirs.extend(shares.iter().map(|s| s.join("pixmaps")).filter(|d| Path::new(d).is_dir()));
+    dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::icon_dirs_in;
+
+    fn file(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// The GTK theme comes first, then what it inherits, then hicolor; each
+    /// theme in the folders its `index.theme` lists, vector first, then the
+    /// largest; and a theme is looked for in every data folder, not only
+    /// /usr/share (NixOS has none there).
+    #[test]
+    fn icons_are_found_the_freedesktop_way() {
+        let root = std::env::temp_dir().join(format!("pleamar-icons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, profile, system, config) = (root.join("home"), root.join("profile"), root.join("system"), root.join("config"));
+        file(&config.join("gtk-3.0/settings.ini"), "[Settings]\ngtk-icon-theme-name=Mine-dark\n");
+        file(&profile.join("icons/Mine-dark/index.theme"), "[Icon Theme]\nInherits=Mine\nDirectories=16/apps\n\n[16/apps]\nSize=16\n");
+        file(&profile.join("icons/Mine-dark/16/apps/term.svg"), "");
+        file(&profile.join("icons/Mine/index.theme"), "[Icon Theme]\nInherits=hicolor\nDirectories=16/apps,256/apps,scalable/apps\n\n[16/apps]\nSize=16\n\n[256/apps]\nSize=256\n\n[scalable/apps]\nSize=64\nType=Scalable\n");
+        for d in ["16/apps", "256/apps", "scalable/apps"] {
+            file(&profile.join(format!("icons/Mine/{d}/term.svg")), "");
+        }
+        file(&system.join("icons/hicolor/48x48/apps/term.png"), "");
+        let data_dirs = format!("{}:{}", profile.display(), system.display());
+        let dirs = icon_dirs_in(home.to_str().unwrap(), home.join(".local/share").to_str().unwrap(), &data_dirs, config.to_str().unwrap());
+        let ours: Vec<String> = dirs.iter().filter(|d| d.starts_with(&root)).map(|d| d.strip_prefix(&root).unwrap().display().to_string()).collect();
+        assert_eq!(
+            ours,
+            [
+                "profile/icons/Mine-dark/16/apps",
+                "profile/icons/Mine/scalable/apps",
+                "profile/icons/Mine/256/apps",
+                "profile/icons/Mine/16/apps",
+                "system/icons/hicolor/48x48/apps",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder that comes up twice (the data home also in XDG_DATA_DIRS,
+    /// /usr/share also at the end) is walked once.
+    #[test]
+    fn no_icon_folder_comes_twice() {
+        let root = std::env::temp_dir().join(format!("pleamar-icons-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, data_home, config) = (root.join("home"), root.join("data"), root.join("config"));
+        file(&data_home.join("icons/hicolor/48x48/apps/a.png"), "");
+        file(&data_home.join("pixmaps/b.png"), "");
+        let data_dirs = format!("{0}:/usr/share:{0}:/usr/share", data_home.display());
+        let dirs = icon_dirs_in(home.to_str().unwrap(), data_home.to_str().unwrap(), &data_dirs, config.to_str().unwrap());
+        let mut seen = std::collections::HashSet::new();
+        assert!(dirs.iter().all(|d| seen.insert(d)), "{dirs:?}");
+        assert!(dirs.contains(&data_home.join("icons/hicolor/48x48/apps")));
+        assert!(dirs.contains(&data_home.join("pixmaps")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

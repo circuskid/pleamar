@@ -1,0 +1,25 @@
+// expect: ok
+// A frosting of the scene's own, and glass that shows it as it is: no tint,
+// its saturation, no mirrored rim and no highlight.
+scene Blur {
+    surface { size: 400, 200 }
+    prop open = 0 ~calm
+    blur = file "shaders/blur.wgsl" {
+        passes: down 0.5 repeat 4, up 2 repeat 3 keep 1, grade 1
+        values: 2 + open, 0.02
+        reach: 48
+    }
+    body {
+        color: #1b2127
+        glass: 100%
+        tint: 0
+        vivid: 100%
+        mirror: 0
+        highlight: 0
+        box { at: 120, 100; size: 200, 140; corner: 20 }
+    }
+    box { at: 300, 100; size: 120, 80; corner: 16; color: #e8eef2; glass: 80%; tint: 40%; vivid: 130%; mirror: 50%; highlight: 150% }
+    column { at: 20, 20; fill: #1b2127; glass: 100%; tint: 10%; vivid: 110%; mirror: 80%; highlight: 60%; padding: 8
+        text "a plate" { size: 12; color: #f5f7f5 }
+    }
+}

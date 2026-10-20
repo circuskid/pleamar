@@ -960,6 +960,7 @@ pub fn run(
                     // Its own shaders: the pipeline is only remade if they changed.
                     if let Some(g) = gpu.as_mut() {
                         g.set_shaders(&scene.shaders);
+                        g.set_blur(scene.blur.as_ref());
                     }
                 }
                 ToRender::Sheet(n) => {
@@ -970,6 +971,7 @@ pub fn run(
                         })
                     });
                     g.set_shaders(&scene.shaders);
+                    g.set_blur(scene.blur.as_ref());
                     letters.allow_atlas(g.atlas_most());
                     // A scene that asks for "the full width" measures whatever its monitor measures, and it
                     // can know it: `screen.width`.
@@ -3860,6 +3862,17 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(8));
             continue;
         };
+        // The numbers the blur is given, worked out for this frame.
+        g.blur_values = match &scene.blur {
+            Some(_) => {
+                let mut v = [0.0; 8];
+                for (k, e) in scene.blur_values.iter().take(8).enumerate() {
+                    v[k] = e.eval(Ctx { props: &props, facts: &facts, seen: None });
+                }
+                v
+            }
+            None => crate::blur::DEFAULT_VALUES,
+        };
         // Buffers on the card for live windows, asked by the thumbnails service.
         #[cfg(target_os = "linux")]
         g.answer_thumbnail_wants();
@@ -4063,7 +4076,7 @@ pub fn run(
             // margin for frosting, rounded to 16 px so as not to remake
             // textures over one pixel. In Marea, the little ball and not the 820 × 680.
             l.glass_box = with_lens.iter().chain(&read).copied().reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]).map(|b| {
-                let m = crate::lens::MARGIN.ceil() as i32;
+                let m = crate::lens::margin().ceil() as i32;
                 let (w, h) = (l.view.size.0 as i32, l.view.size.1 as i32);
                 let x0 = ((b[0] - m).max(0) / 16) * 16;
                 let y0 = ((b[1] - m).max(0) / 16) * 16;
@@ -4212,7 +4225,7 @@ pub fn run(
         if !op.no_vsync && !op.naive {
             let right_now = Instant::now();
             if g.uses_mailbox() {
-                let mhz = sheets.iter().find(|l| l.drives_pace).map_or(60_000, |l| l.mhz.max(1));
+                let mhz = sheets.iter().find(|l| l.drives_pace).map_or(60_000, |l| l.pace_mhz());
                 // With `rate:`, the scene decides the step and not the monitor: a bar
                 // that breathes does not need 165 frames per second, and painting them is what
                 // costs. Never faster than the screen, which would be no use.
@@ -4418,7 +4431,7 @@ pub fn run(
             let fifo = g.blocks_on_screen(l) && !op.no_vsync && !op.naive;
             if fifo && l.open && in_flight.iter().any(|f| f.0 == l.id) {
                 if !l.unseen {
-                    let period = Duration::from_secs_f64(1000.0 / l.mhz.max(1) as f64);
+                    let period = Duration::from_secs_f64(1000.0 / l.pace_mhz() as f64);
                     let limit = Instant::now() + (period * 3).max(Duration::from_millis(50));
                     while in_flight.iter().any(|f| f.0 == l.id) {
                         let left = limit.saturating_duration_since(Instant::now());
@@ -4791,7 +4804,7 @@ pub fn run(
             // The LEARNT period is no good here: a scene that is always
             // late teaches it that the screen gives 28 ms and then it is never
             // late. It is compared with the monitor's real refresh.
-            let mut real = sheets.iter().find(|l| l.drives_pace).map_or(16.7, |l| 1_000_000.0 / l.mhz.max(1) as f32);
+            let mut real = sheets.iter().find(|l| l.drives_pace).map_or(16.7, |l| 1_000_000.0 / l.pace_mhz() as f32);
             if rate_now > 0 {
                 real = real.max(1000.0 / rate_now as f32);
             }

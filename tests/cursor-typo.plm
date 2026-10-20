@@ -1,0 +1,5 @@
+// expect: error «Did you mean 'zoom_in'»
+scene CursorTypo {
+    surface { size: 100, 100 }
+    zone box z { at: 50, 50; size: 20, 20; cursor: zoomin }
+}

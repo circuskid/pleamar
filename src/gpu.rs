@@ -7,7 +7,7 @@ use crate::text::{LayoutKey, AtlasSlot, Texts, ATLAS_MOST, ATLAS_SIZE};
 use std::ops::Range;
 
 const PER_SHAPE: usize = 20;
-const PER_ELEMENT: usize = 60;
+const PER_ELEMENT: usize = 64;
 /// How many groups with opacity or effects can be blending in the same frame.
 /// They share a few layers: each one is painted into one right before it is
 /// blended (see `paint`), so this is not memory, only a sanity limit.
@@ -447,6 +447,8 @@ fn glass_options(e: &mut [f32], g: Option<&crate::scene::Glass>, b: [f32; 4], c:
     e[27] = g.frost.eval(c);
     e[38] = g.smoke.eval(c);
     e[39] = g.milk.eval(c);
+    // Its own slot (`glass4`): tint, saturation, mirror, highlight.
+    e[60..64].copy_from_slice(&[g.tint.eval(c), g.vivid.eval(c), g.mirror.eval(c), g.highlight.eval(c)]);
 }
 
 /// The width of a glass's bevel: a third of its short side, not going over 30 px.
@@ -1939,6 +1941,10 @@ pub struct Gpu {
     _gl_instance: Option<wgpu::Instance>,
     /// What unmixes and frosts what is behind the glass.
     lens: crate::lens::Pipelines,
+    /// The scene's blur (`blur.rs`), built, and the numbers it is given this frame.
+    blur: crate::blur::Built,
+    pub blur_sampler: wgpu::Sampler,
+    pub blur_values: [f32; 8],
     /// For a sheet without a lens: a one-pixel background nobody reads.
     no_backdrop_group: wgpu::BindGroup,
     /// Whether the screen accepts having a canvas copied to it: without that, there is no lens.
@@ -2155,6 +2161,14 @@ impl Gpu {
         let no_layers_group = Self::make_layers(&device, &pipeline, format, 1, 1, 1).1;
         let erase = Self::erase_pipeline(&device, format);
         let lens = crate::lens::Pipelines::new(&device);
+        let blur = crate::blur::Built::new(&device, crate::blur::default_plan(), 1).expect("the default blur builds");
+        let blur_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let can_copy = first.is_none_or(|f| f.get_capabilities(&adapter).usages.contains(wgpu::TextureUsages::COPY_DST));
         let nothing = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("no backdrop"),
@@ -2168,7 +2182,7 @@ impl Gpu {
         }).create_view(&Default::default());
         let no_backdrop_group = Self::build_backdrop_group(&device, &pipeline, &nothing, &nothing, &sampler);
         #[allow(unused_mut)]
-        let mut g = Gpu { _gl_instance: gl_instance, lens, no_backdrop_group, can_copy, own_frames: Default::default(), adapter, device, queue, format, alpha, non_blocking, pipeline, particles, screen, multiply, erase, pipeline_layout, user_code: base, shapes_buffer, elements_buffer, points_buffer, stops_buffer, atlas, atlas_view, windows, windows_view, windows_dims: (1, 1, 1), #[cfg(target_os = "linux")] dmabufs: Default::default(), #[cfg(target_os = "linux")] copies: Default::default(), #[cfg(target_os = "linux")] yuv: None, #[cfg(target_os = "linux")] thumbs: Default::default(), #[cfg(target_os = "linux")] fit: None, #[cfg(target_os = "linux")] hash: None, #[cfg(target_os = "linux")] summer: None, last_submission: Default::default(), render_modifiers: Vec::new(), sampler, capacity: (INITIAL_SHAPES * PER_SHAPE, INITIAL_ELEMENTS * PER_ELEMENT, INITIAL_POINTS, INITIAL_STOPS), limit, limit_warned: false, scene_group, no_layers_group };
+        let mut g = Gpu { _gl_instance: gl_instance, lens, blur, blur_sampler, blur_values: crate::blur::DEFAULT_VALUES, no_backdrop_group, can_copy, own_frames: Default::default(), adapter, device, queue, format, alpha, non_blocking, pipeline, particles, screen, multiply, erase, pipeline_layout, user_code: base, shapes_buffer, elements_buffer, points_buffer, stops_buffer, atlas, atlas_view, windows, windows_view, windows_dims: (1, 1, 1), #[cfg(target_os = "linux")] dmabufs: Default::default(), #[cfg(target_os = "linux")] copies: Default::default(), #[cfg(target_os = "linux")] yuv: None, #[cfg(target_os = "linux")] thumbs: Default::default(), #[cfg(target_os = "linux")] fit: None, #[cfg(target_os = "linux")] hash: None, #[cfg(target_os = "linux")] summer: None, last_submission: Default::default(), render_modifiers: Vec::new(), sampler, capacity: (INITIAL_SHAPES * PER_SHAPE, INITIAL_ELEMENTS * PER_ELEMENT, INITIAL_POINTS, INITIAL_STOPS), limit, limit_warned: false, scene_group, no_layers_group };
         #[cfg(target_os = "linux")]
         if first.is_none() {
             g.render_modifiers = g.bgra_modifiers(ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT);
@@ -2267,6 +2281,27 @@ impl Gpu {
         match pollster::block_on(scope.pop()) {
             None => Ok(pipelines),
             Some(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The blur in use.
+    pub fn blur(&self) -> &crate::blur::Built {
+        &self.blur
+    }
+
+    /// The scene's blur, or the default without one: rebuilt only if it changed.
+    /// If the driver refuses it, the one in use stays, which is said once.
+    pub fn set_blur(&mut self, plan: Option<&crate::blur::Plan>) {
+        let plan = plan.cloned().unwrap_or_else(crate::blur::default_plan);
+        if plan == self.blur.plan {
+            return;
+        }
+        match crate::blur::Built::new(&self.device, plan, self.blur.generation + 1) {
+            Ok(b) => {
+                crate::blur::set_reach(b.plan.reach);
+                self.blur = b;
+            }
+            Err(e) => eprintln!("blur · the scene's blur could not be built, and the one in use stays: {e}"),
         }
     }
 
@@ -3155,8 +3190,8 @@ impl Gpu {
         let whole_screen = matches!(&l.target, Target::Frames(f) if f.whole_screen());
         if !l.wants_lens || !self.can_copy || whole_screen {
             l.lens = None;
-        } else if l.lens.is_none() {
-            l.lens = Some(crate::lens::Lens::new(&self.device, self.format, l.px));
+        } else if l.lens.as_ref().is_none_or(|x| x.blur_generation() != self.blur.generation) {
+            l.lens = Some(crate::lens::Lens::new(&self.device, self.format, l.px, &self.blur));
             // New canvases: nothing is known of what they hold.
             l.painted_as.clear();
             l.damage_log.clear();
@@ -3171,7 +3206,7 @@ impl Gpu {
         let over_own = glass && !whole_screen && l.lens.is_some() && d.glass_over_own(v);
         if glass && (whole_screen || over_own) {
             l.idle_own_frames = 0;
-            if l.own.as_ref().is_none_or(|o| o.px != l.px) {
+            if l.own.as_ref().is_none_or(|o| o.px != l.px || o.blur_generation() != self.blur.generation) {
                 l.own = Some(crate::lens::Own::new(self, l.px));
             }
         } else if glass && l.own.is_some() && l.idle_own_frames < IDLE_OWN_FRAMES {
@@ -3456,7 +3491,7 @@ impl Gpu {
             let own_region = |at: &mut dyn Iterator<Item = u32>| -> Option<(u32, u32, u32, u32)> {
                 let own = own?;
                 let (pw, ph) = own.px;
-                let m = crate::lens::MARGIN;
+                let m = crate::lens::margin();
                 let b = at.filter(|k| (*k as usize) < d.element_count()).map(|k| {
                     let e = &d.elements[k as usize * PER_ELEMENT + 4..k as usize * PER_ELEMENT + 8];
                     [e[0] - view_origin[0] - m, e[1] - view_origin[1] - m, e[2] - view_origin[0] + m, e[3] - view_origin[1] + m]
@@ -3675,7 +3710,7 @@ const MOST_CUTS: usize = 4;
 /// this frame's. (Growing a piece only by the glasses drawn over the first one
 /// around it was tried, and still flickered.)
 fn grown_for_glass(cuts: Vec<[u32; 4]>, d: &DrawList, view: [f32; 4], scale: f32, px: (u32, u32)) -> Option<Vec<[u32; 4]>> {
-    let m = crate::lens::MARGIN;
+    let m = crate::lens::margin();
     let (pw, ph) = (px.0 as f32, px.1 as f32);
     let mut marks: Vec<usize> = d.glass_marks.iter().map(|k| *k as usize).filter(|k| *k < d.element_count()).collect();
     marks.sort_unstable();
@@ -3778,6 +3813,13 @@ thread_local! {
 }
 
 impl Sheet {
+    /// Its monitor's refresh in mHz, for pacing: 60 Hz where the compositor
+    /// does not tell it (a headless output says 0, and a period of 1 mHz put
+    /// the render to sleep for a thousand seconds after its first frame).
+    pub fn pace_mhz(&self) -> i32 {
+        if self.mhz > 0 { self.mhz } else { 60_000 }
+    }
+
     /// Its size in pixels.
     pub fn px(&self) -> (u32, u32) {
         self.px
