@@ -139,22 +139,44 @@ fn list(c: &Connection, own: Option<&Mutex<Registry>>) -> Vec<String> {
     }
 }
 
-/// A tooltip's description may carry a little HTML (`<b>`, `<i>`, `<br>`,
-/// `<a href>`, `<img>`), and a text paints none of it: the words stay, a
-/// `<br>` is a new line, and the rest goes, as with a notification's body.
+/// A tooltip's description may carry a little markup, and a text paints none
+/// of it. The spec allows `<b>`, `<i>`, `<u>`, `<a href>` and `<img alt>`, in
+/// the description only: the words stay, an image becomes its `alt`, and the
+/// rest of the tag goes, as with a notification's body. `<br>` is not in the
+/// spec but common, and is a new line. A `<` that starts no tag (`a < b`,
+/// `<3`) is the character itself.
 fn plain(markup: &str) -> String {
     let mut lines = String::with_capacity(markup.len());
     let mut rest = markup;
     while let Some(k) = rest.find('<') {
-        let end = rest[k..].find('>').map_or(rest.len(), |e| k + e + 1);
-        let tag = &rest[k..end];
-        let name: String = tag[1..].trim_start_matches('/').chars().take_while(char::is_ascii_alphabetic).collect();
         lines.push_str(&rest[..k]);
-        lines.push_str(if name.eq_ignore_ascii_case("br") { "\n" } else { tag });
-        rest = &rest[end..];
+        rest = &rest[k..];
+        let opens = rest[1..].trim_start_matches('/').starts_with(|c: char| c.is_ascii_alphabetic());
+        let Some(end) = rest.find('>').filter(|_| opens) else {
+            // strip_markup would take it for a tag: it is read back as `<`.
+            lines.push_str("&lt;");
+            rest = &rest[1..];
+            continue;
+        };
+        let tag = &rest[..=end];
+        let name: String = tag[1..].trim_start_matches('/').chars().take_while(char::is_ascii_alphabetic).collect();
+        if name.eq_ignore_ascii_case("br") {
+            lines.push('\n');
+        } else if name.eq_ignore_ascii_case("img") {
+            lines.push_str(alt(tag));
+        }
+        rest = &rest[end + 1..];
     }
     lines.push_str(rest);
     super::notifications::strip_markup(&lines).trim().to_owned()
+}
+
+/// An `<img>`'s `alt`, which the spec makes mandatory; `""` if it has none.
+fn alt(tag: &str) -> &str {
+    let Some(k) = tag.find(" alt=") else { return "" };
+    let value = &tag[k + 5..];
+    let Some(quote) = value.chars().next().filter(|q| *q == '"' || *q == '\'') else { return "" };
+    value[1..].split(quote).next().unwrap_or("")
 }
 
 fn report(c: &Connection, own: Option<&Mutex<Registry>>) -> SysValue {
@@ -354,7 +376,37 @@ mod tests {
         assert_eq!(plain("<b>Telegram</b><br/>3 new &amp; 1 <i>muted</i>"), "Telegram\n3 new & 1 muted");
         assert_eq!(plain("one<BR>two<br />three"), "one\ntwo\nthree");
         assert_eq!(plain("<a href=\"https://example.org\">a link</a> <img src=\"x.png\"/>"), "a link");
+        assert_eq!(plain("<u>under</u>lined"), "underlined");
         assert_eq!(plain("  <p>padded</p>\n"), "padded");
         assert_eq!(plain(""), "");
+    }
+
+    #[test]
+    fn a_tooltip_body_reads_its_entities() {
+        assert_eq!(plain("&lt;b&gt; is not bold"), "<b> is not bold");
+        assert_eq!(plain("say &quot;hi&quot; &apos;there&apos;"), "say \"hi\" 'there'");
+    }
+
+    #[test]
+    fn a_br_at_either_end_is_no_line() {
+        assert_eq!(plain("<br/>first"), "first");
+        assert_eq!(plain("last<br>"), "last");
+        assert_eq!(plain("<br><br>middle<br />"), "middle");
+    }
+
+    #[test]
+    fn a_bare_less_than_stays() {
+        assert_eq!(plain("1 < 2"), "1 < 2");
+        assert_eq!(plain("a < b and <b>c</b>"), "a < b and c");
+        assert_eq!(plain("I <3 it"), "I <3 it");
+        assert_eq!(plain("ends in <"), "ends in <");
+        assert_eq!(plain("<b never closed"), "<b never closed");
+    }
+
+    #[test]
+    fn an_image_is_its_alt() {
+        assert_eq!(plain("<img src=\"/x.png\" alt=\"[new]\"/> mail"), "[new] mail");
+        assert_eq!(plain("<img alt='a &amp; b' src='/x.png'>"), "a & b");
+        assert_eq!(plain("<img src=\"/x.png\"/>"), "");
     }
 }
