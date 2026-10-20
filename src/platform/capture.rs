@@ -127,7 +127,10 @@ struct State {
     /// Counts monitors coming and going, so that a turn with the compositor
     /// can tell whether one came or went during it.
     changes: u64,
-    synced: bool,
+    /// The turns asked for and the last one answered, so that a late answer
+    /// to a turn that timed out cannot pass for the next one.
+    asked: u64,
+    synced: u64,
     shot: Shot,
 }
 
@@ -228,9 +231,10 @@ impl Link {
 
     /// One turn with the compositor.
     fn sync(&mut self) -> Result<(), Asked> {
-        self.state.synced = false;
-        self.connection.display().sync(&self.qh, ());
-        self.wait(SYNC_WAIT, |s| s.synced)
+        self.state.asked += 1;
+        let turn = self.state.asked;
+        self.connection.display().sync(&self.qh, turn);
+        self.wait(SYNC_WAIT, move |s| s.synced >= turn)
     }
 
     /// The monitors as they are now, so that one unplugged a moment ago is not
@@ -461,11 +465,14 @@ impl Axis {
     fn around(at: f64, whole: i32, pixels: i64, scale: f64, reversed: bool) -> Axis {
         let upright = (at * scale).floor() as i64;
         let pixel = if reversed { pixels - 1 - upright } else { upright };
-        let unit = (pixel as f64 / scale).floor() as i64;
-        let step = 120 / gcd((scale * 120.0).round() as i64, 120).max(1);
+        // In 120ths, as a fractional scale is given: dividing by 1.1 in floating
+        // point puts pixel 33 in unit 29.999….
+        let k = ((scale * 120.0).round() as i64).max(1);
+        let unit = (pixel * 120).div_euclid(k);
+        let step = 120 / gcd(k, 120).max(1);
         let from = (unit.div_euclid(step) * step).max(0);
         let to = ((unit + step).div_euclid(step) * step).min(whole as i64).max(from + 1);
-        let first = (from as f64 * scale).round() as i64;
+        let first = from * k / 120;
         let start = if reversed { whole as i64 - to } else { from };
         Axis { start: start as i32, len: (to - from) as i32, offset: pixel - first, reversed }
     }
@@ -606,10 +613,10 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for State {
-    fn event(e: &mut Self, _: &wl_callback::WlCallback, ev: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+impl Dispatch<wl_callback::WlCallback, u64> for State {
+    fn event(e: &mut Self, _: &wl_callback::WlCallback, ev: wl_callback::Event, turn: &u64, _: &Connection, _: &QueueHandle<Self>) {
         if let wl_callback::Event::Done { .. } = ev {
-            e.synced = true;
+            e.synced = e.synced.max(*turn);
         }
     }
 }
@@ -840,6 +847,23 @@ mod tests {
                     let up = (at * 1.5_f64).floor() as i64;
                     let want = if reversed { 2559 - up } else { up };
                     assert_eq!(got[a.index(got.len() as u32) as usize], want, "reversed {reversed}, rounded {round}, at {at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pixel_on_a_grid_line_is_in_the_cell_after_it() {
+        // Pixels that start exactly on a grid line, where a division in
+        // floating point lands just short of it (33 / 1.1 = 29.999…).
+        for (scale, at, pixel) in [(1.1, 30.1, 33), (1.1, 60.05, 66), (1.25, 4.0, 5), (1.25, 8.1, 10), (1.75, 4.0, 7), (1.75, 8.2, 14)] {
+            for reversed in [false, true] {
+                for round in [false, true] {
+                    let pixels = (120.0 * scale) as i64;
+                    let a = Axis::around(at, 120, pixels, scale, reversed);
+                    let got = region(a.start, a.len, 120, scale, reversed, round);
+                    let want = if reversed { pixels - 1 - pixel } else { pixel };
+                    assert_eq!(got[a.index(got.len() as u32) as usize], want, "scale {scale}, at {at}, reversed {reversed}, rounded {round}");
                 }
             }
         }
