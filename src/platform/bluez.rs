@@ -662,9 +662,12 @@ fn reply(what: &str, args: &[SysValue]) -> Option<Result<(), String>> {
         ("bluetooth.cancel", []) => {
             // A no from whoever sits there: BlueZ is told `Rejected`.
             match withdraw(|a| a.id == id, Answer::No) {
-                // What is only shown waits for nothing here: the pairing itself is called off.
+                // `Rejected` already fails the pairing; a code that is only shown
+                // waits for no answer that could say no, so it is called off.
                 Some(a) => {
-                    call_off(a.device);
+                    if a.reply.is_none() {
+                        call_off(a.device);
+                    }
                     Ok(())
                 }
                 None => Err("that question is not being asked any more".into()),
