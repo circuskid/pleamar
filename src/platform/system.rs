@@ -187,11 +187,38 @@ pub fn session_command(what: &str, _args: &[SysValue]) -> Result<(), String> {
 /// `{ present = false }`: the service exists, what is missing is a battery.
 fn battery_now() -> SysValue {
     let read = |path: std::path::PathBuf| std::fs::read_to_string(path).ok().map(|s| s.trim().to_owned());
-    let cell = std::fs::read_dir("/sys/class/power_supply").ok().and_then(|d| {
-        d.filter_map(Result::ok).map(|f| f.path()).find(|p| read(p.join("type")).as_deref() == Some("Battery") && p.join("capacity").exists())
-    });
+    let mut cells: Vec<std::path::PathBuf> = std::fs::read_dir("/sys/class/power_supply")
+        .map(|d| d.filter_map(Result::ok).map(|f| f.path()).collect())
+        .unwrap_or_default();
+    // `read_dir` has no order; sorted, `BAT0` always wins over a second system cell.
+    cells.sort();
+    // A wireless mouse, a keyboard or a pen exposes its own cell under `power_supply` with
+    // `scope = Device` — and sits at 0 % while it is idle. It is never the machine's battery.
+    let system = |p: &std::path::Path| read(p.join("scope")).as_deref() != Some("Device");
+    let present = |p: &std::path::Path| read(p.join("present")).as_deref() != Some("0");
+    let battery = |p: &std::path::Path| {
+        read(p.join("type")).as_deref() == Some("Battery")
+            && (p.join("capacity").exists() || p.join("energy_now").exists() || p.join("charge_now").exists())
+    };
+    let cell = cells
+        .iter()
+        .map(|p| p.as_path())
+        .find(|p| battery(p) && system(p) && present(p))
+        .or_else(|| cells.iter().map(|p| p.as_path()).find(|p| battery(p) && system(p)))
+        .or_else(|| cells.iter().map(|p| p.as_path()).find(|p| battery(p)));
     let Some(cell) = cell else { return SysValue::Map(vec![("present".into(), SysValue::Bool(false))]) };
-    let percent = read(cell.join("capacity")).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    // `capacity` is the kernel's own percentage; some batteries only expose the raw energy
+    // (or charge) counters, so those are the fallback.
+    let ratio = |now: &str, full: &str| -> Option<f64> {
+        let now: f64 = read(cell.join(now))?.parse().ok()?;
+        let full: f64 = read(cell.join(full))?.parse().ok()?;
+        (full > 0.0).then(|| now / full * 100.0)
+    };
+    let percent = read(cell.join("capacity"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| ratio("energy_now", "energy_full"))
+        .or_else(|| ratio("charge_now", "charge_full"))
+        .unwrap_or(0.0);
     let status = read(cell.join("status")).unwrap_or_default();
     SysValue::Map(vec![
         ("present".into(), SysValue::Bool(true)),
