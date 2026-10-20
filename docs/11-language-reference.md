@@ -333,7 +333,7 @@ What each service brings is in the vocabulary (§17), and **asking it for what i
 | `network.kind` | `none`, `wired` or `wifi` |
 | `polkit.error` | `none`, or `wrong` after an answer that was not it |
 | `network.error` | why the last attempt to join a network did not get in: `none` (it did, or none was made), `password` (wrong, or none given), `timeout`, `unsupported`, `busy` or `failed`. With iwd; with NetworkManager it stays `none`, and a network that was not joined is one that never turns `active` |
-| the `bool` ones | `muted`, `charging`, `present`, `online`, `playing` |
+| the `bool` ones | `muted`, `charging`, `present`, `online`, `playing`, `can_seek` |
  Whatever does not come in a report stays as it was.
 
 **Lists, into a model, with no logic.** What a service reports as a list goes
