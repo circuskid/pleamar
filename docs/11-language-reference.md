@@ -410,6 +410,16 @@ The permissions are the scene's, and they are the same as `sys.watch`'s: `servic
 
 A plugin has its own, under its name: what it saves the scene does not see, nor the other way round.
 
+**Talking to another scene.** A shell made of a bar, its notices and an OSD is
+better as separate scenes, each one able to restart on its own. One tells
+another what `pleamar --say` would, down the same socket and with the same
+words: `sys.call("say", "bar", "emit card_landed 3")`, with `services:
+"say:bar"`, or `"say:*"` for any scene. What the other one answers is not
+brought back. A scene that is not running is an error for the caller, which
+names the ones that are, and so is an order it does not understand. One call
+is one command. The two share no state: the one that owns a value keeps it as
+a fact, and tells the others with `emit` when it changes.
+
 **One per monitor.** `screens: each [max N]` repeats the surface on every monitor (4 at most, unless said otherwise), and **each copy has its own**: its properties, its zones and its rules. Inside:
 
 | | |

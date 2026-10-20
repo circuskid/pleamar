@@ -317,6 +317,20 @@ fn check_service_permission(c: &Mutex<Shared>, name: &str, commands: bool) -> ml
     Err(denied(c, &format!("use the '{service}' service"), &format!("services: \"{service}\"")))
 }
 
+/// May this logic tell that scene something? `services: "say:bar"` lets it
+/// talk to `bar`, `"say:*"` to any. By the scene, not by the command: what a
+/// scene does with an order is up to it, as it is with `--say`.
+pub(crate) fn say_allowed(declared: &[String], scene: &str) -> bool {
+    declared.iter().any(|d| d == "say:*" || d.strip_prefix("say:") == Some(scene))
+}
+
+fn check_say_permission(c: &Mutex<Shared>, scene: &str) -> mlua::Result<()> {
+    if say_allowed(&c.lock().unwrap().permissions.services, scene) {
+        return Ok(());
+    }
+    Err(denied(c, &format!("talk to the scene '{scene}'"), &format!("services: \"say:{scene}\"  (or \"say:*\" for any scene)")))
+}
+
 /// What the logic hands to the system: numbers, texts and tables. A table with
 /// keys 1..n is a list; any other, a map. Up to six levels: deeper than
 /// that, what is being passed is not data.
@@ -1226,9 +1240,22 @@ impl LuauScript {
         })?)?;
         let (c, mine) = (self.c.clone(), who.clone());
         sys.set("call", lua.create_function(move |_, (name, args): (String, mlua::Variadic<Value>)| {
-            check_service_permission(&c, &name, true)?;
             let args: Vec<SysValue> = args.iter().map(|v| lua_to_value(v, 0)).collect();
-            crate::platform::command(&mine, &name, &args).map_err(mlua::Error::runtime)
+            if name != "say" {
+                check_service_permission(&c, &name, true)?;
+                return crate::platform::command(&mine, &name, &args).map_err(mlua::Error::runtime);
+            }
+            if let Some(SysValue::Text(scene)) = args.first() {
+                check_say_permission(&c, scene)?;
+            }
+            // Waiting for the other scene does not count against the handler's
+            // patience, as with `sys.ask`.
+            let t0 = Instant::now();
+            let said = crate::platform::command(&mine, &name, &args);
+            if let Some(l) = &mut c.lock().unwrap().deadline {
+                *l += t0.elapsed();
+            }
+            said.map_err(mlua::Error::runtime)
         })?)?;
         // The same, but it answers: `sys.ask("tray.menu", key)` returns the menu.
         let (c, mine) = (self.c.clone(), who.clone());
@@ -1674,7 +1701,7 @@ pub static REQUIRED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mute
 
 #[cfg(test)]
 mod tests {
-    use super::command_allowed;
+    use super::{command_allowed, say_allowed};
 
     #[test]
     fn a_command_declared_with_its_script_runs_only_that() {
@@ -1685,5 +1712,42 @@ mod tests {
         assert!(!command_allowed(&declared, "node", &s(&["-e", "require('fs').rmSync('/')"])));
         assert!(!command_allowed(&declared, "node", &s(&[])));
         assert!(!command_allowed(&declared, "sh", &s(&["-c", "true"])));
+    }
+
+    #[test]
+    fn a_scene_is_told_only_by_name_or_by_say_star() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let bar = s(&["audio", "say:bar"]);
+        assert!(say_allowed(&bar, "bar"));
+        assert!(!say_allowed(&bar, "toasts"));
+        assert!(!say_allowed(&bar, "bar2"));
+        // Neither the service's bare name nor a dotted star is the permission.
+        assert!(!say_allowed(&s(&["say", "say.*"]), "bar"));
+        assert!(!say_allowed(&s(&[]), "bar"));
+        assert!(say_allowed(&s(&["say:*"]), "toasts"));
+    }
+
+    #[test]
+    fn say_from_the_logic_is_refused_or_errs_when_nobody_is_there() {
+        use super::{LuauScript, Script};
+        use crate::scene::{Event, ToRender};
+        let dir = std::env::temp_dir().join(format!("pleamar-say-logic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A name no scene has, so that nothing real is told anything.
+        let absent = format!("nobody-{}", std::process::id());
+        let (scene, logic) = (dir.join("teller.plm"), dir.join("teller.luau"));
+        std::fs::write(&scene, format!("scene Teller {{\n    surface {{ size: 10, 10 }}\n    permissions {{ services: \"say:{absent}\" }}\n    text refused = \"\"\n    text absent = \"\"\n}}\n")).unwrap();
+        std::fs::write(&logic, format!("local _, e = pcall(sys.call, \"say\", \"toasts\", \"emit x\")\ntext.refused = tostring(e)\nlocal _, f = pcall(sys.call, \"say\", \"{absent}\", \"emit x\")\ntext.absent = tostring(f)\n")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (to_logic, _) = std::sync::mpsc::channel();
+        let blocked = std::sync::Arc::default();
+        let mut s = LuauScript::new(&scene.to_string_lossy(), &logic.to_string_lossy(), tx.clone(), to_logic, std::sync::Arc::clone(&blocked));
+        s.scene();
+        s.on_event(Event::ReloadLogic, &mut crate::logic::Context::for_plugin(tx, blocked));
+        let texts: std::collections::HashMap<&str, String> = rx.try_iter().filter_map(|m| if let ToRender::Text(k, v) = m { Some((k, v)) } else { None }).collect();
+        assert!(texts["refused"].contains("no permission to talk to the scene 'toasts'"), "{}", texts["refused"]);
+        assert!(texts["refused"].contains("services: \"say:toasts\""), "{}", texts["refused"]);
+        assert!(texts["absent"].contains(&format!("the scene '{absent}' is not running")), "{}", texts["absent"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

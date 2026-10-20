@@ -156,6 +156,12 @@ pub fn command(from: &str, name: &str, args: &[SysValue]) -> Result<(), String> 
     if name.starts_with("files.") {
         return files::command(from, name, args);
     }
+    if name == "say" {
+        return match args {
+            [SysValue::Text(scene), SysValue::Text(line)] => say(scene, line),
+            _ => Err("`say` takes the scene and one command: sys.call(\"say\", \"bar\", \"emit card_landed 3\")".into()),
+        };
+    }
     if let ("clipboard.set", [SysValue::Text(t)]) = (name, args) {
         clipboard_write(t);
         return Ok(());
@@ -677,6 +683,51 @@ pub fn send(scene: Option<&str>, commands: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// One scene telling another one of `--say`'s commands: `sys.call("say",
+/// "bar", "emit card_landed 3")`. The same socket and the same words, so the
+/// other scene needs nothing new to be told. What it answers is not brought
+/// back, except a `? …`, which is the error: so is a scene that is not there,
+/// rather than a word lost on the way.
+#[cfg(unix)]
+pub fn say(scene: &str, command: &str) -> Result<(), String> {
+    // The name becomes a path: it stays a name.
+    if scene.is_empty() || scene.starts_with('.') || scene.contains(['/', '\0']) {
+        return Err(format!("'{scene}' is not the name of a scene"));
+    }
+    // One call, one command: a second line would be a second one, unasked for.
+    if command.contains(['\n', '\r']) {
+        return Err("`say` takes one command, on one line: call it again for the next".into());
+    }
+    let (path, _) = reach(scene)?;
+    say_at(&path, scene, command).map_err(|e| match running_scenes() {
+        others if e.ends_with("is not running") && !others.is_empty() => format!("{e} (running: {})", others.join(", ")),
+        _ => e,
+    })
+}
+#[cfg(not(unix))]
+pub fn say(_: &str, _: &str) -> Result<(), String> {
+    Err("this system has nowhere to receive commands yet".into())
+}
+
+#[cfg(unix)]
+fn say_at(path: &std::path::Path, scene: &str, command: &str) -> Result<(), String> {
+    use std::io::Write;
+    // No socket, or one left behind by a scene that ended: nobody to tell.
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|_| format!("the scene '{scene}' is not running"))?;
+    writeln!(s, "{command}").map_err(|e| format!("'{scene}': {e}"))?;
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    // An order answers nothing and the connection closes at once; a `? …` comes
+    // as fast. Whatever takes longer (`wait`, `watch`) is not waited for: the
+    // logic does not stand still for another scene.
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+    let mut answer = String::new();
+    let _ = std::io::Read::read_to_string(&mut s, &mut answer);
+    match answer.lines().find_map(|l| l.strip_prefix("? ")) {
+        Some(wrong) => Err(format!("'{scene}' answers: {wrong}")),
+        None => Ok(()),
+    }
+}
+
 #[cfg(not(unix))]
 pub fn listen_for_commands(_: &str, _: Commands) {}
 #[cfg(not(unix))]
@@ -1122,4 +1173,46 @@ pub use wayland::icon;
 #[cfg(not(target_os = "linux"))]
 pub fn icon(_: &str) -> Option<std::path::PathBuf> {
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{say, say_at};
+    use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn a_scene_tells_another_and_hears_only_what_went_wrong() {
+        let dir = std::env::temp_dir().join(format!("pleamar-say-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stand-in for a scene's listener: it answers as `--say`'s does, nothing to an order.
+        let path = dir.join("bar.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (heard, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for c in listener.incoming().map_while(Result::ok) {
+                let mut w = c.try_clone().unwrap();
+                for line in BufReader::new(c).lines().map_while(Result::ok) {
+                    if !line.starts_with("emit ") {
+                        let _ = writeln!(w, "? I don't understand '{line}'");
+                    }
+                    heard.send(line).unwrap();
+                }
+            }
+        });
+        assert_eq!(say_at(&path, "bar", "emit card_landed 3"), Ok(()));
+        assert_eq!(lines.recv().unwrap(), "emit card_landed 3");
+        assert_eq!(say_at(&path, "bar", "emitt card_landed"), Err("'bar' answers: I don't understand 'emitt card_landed'".into()));
+
+        // Not there: no socket, or one a scene that ended left behind.
+        assert_eq!(say_at(&dir.join("toasts.sock"), "toasts", "emit x"), Err("the scene 'toasts' is not running".into()));
+        let left = dir.join("osd.sock");
+        drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+        assert_eq!(say_at(&left, "osd", "emit x"), Err("the scene 'osd' is not running".into()));
+
+        // A name stays a name, and one call is one command.
+        assert!(say("../bar", "emit x").is_err());
+        assert!(say("bar", "emit x\nquit").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -357,6 +357,8 @@ pleamar --say osd "text label Volume" "fact value 0.4" "emit popup"
 
 A `get` right after an `emit` answers before the emit's rules have run. Put a `wait` between them (`"emit flip" "wait flag == true 1s" "get flag"`).
 
+**From another scene** it is the same order, from its logic: `sys.call("say", "osd", "emit popup")`, with `permissions { services: "say:osd" }` (see the reference, *Talking to another scene*).
+
 **A global shortcut is this**: a compositor bind that runs that order. In Hyprland:
 
 ```lua
