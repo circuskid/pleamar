@@ -133,7 +133,7 @@ pub const SERVICES: &[(&str, &[&str])] = &[
     ("battery", &["present", "percent", "charging"]),
     ("brightness", &["present", "level"]),
     ("network", &["online", "kind", "name", "strength", "wifi", "error", "networks"]),
-    ("bluetooth", &["present", "powered", "discovering", "devices"]),
+    ("bluetooth", &["present", "powered", "discovering", "devices", "pairing", "pairing_id", "pairing_address", "pairing_name", "pairing_code"]),
     ("media", &["playing", "title", "artist", "album", "length", "position", "rate", "can_seek", "art", "player", "players"]),
     ("window", &["title", "class", "monitor", "fullscreen", "maximized", "list"]),
     ("thumbnails", &["list", "capturing"]),

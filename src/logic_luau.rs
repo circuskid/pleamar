@@ -512,6 +512,35 @@ impl LuauScript {
         c.translations = e.translations.clone();
     }
 
+    /// Whether this scene is asked what a Bluetooth pairing asks. Read again
+    /// with each scene, so one that stops declaring it stops being asked.
+    fn offer_pairing(&self) {
+        if self.prefix.is_some() {
+            return;
+        }
+        let who = self.owner();
+        // A pairing asks only a scene that says it shows what is asked —it
+        // declares `pairing`— and may answer it. Watching Bluetooth is not
+        // saying that: a bar's icon would turn a pairing that just works into a
+        // question nobody sees. Only the scene's own declaration counts: a
+        // plugin's `bluetooth` lands in the same list under its name, and
+        // importing one must not turn the scene's pairing into questions.
+        let plugins: Vec<String> = self.plugins.iter().map(|p| format!("{}.", p.definition.name)).collect();
+        let pairing = {
+            let c = self.c.lock().unwrap();
+            let declared = c.services.iter().any(|s| {
+                s.name == "bluetooth" && !plugins.iter().any(|p| s.alias.starts_with(p.as_str())) && s.fields.iter().any(|f| f.name == "pairing")
+            });
+            let has = |what: &str| c.permissions.services.iter().any(|x| x == what);
+            let may = has("bluetooth.*") || ["bluetooth.answer", "bluetooth.confirm", "bluetooth.cancel"].iter().all(|w| has(w));
+            if declared && !may {
+                eprintln!("logic  · `pairing` is shown but cannot be answered: add `services: \"bluetooth.*\"` to this scene's `permissions`");
+            }
+            declared && may
+        };
+        crate::platform::bluetooth_pairing(&who, pairing);
+    }
+
     /// The services the scene asked for with `service`: one per thread, and whatever they report
     /// is spread on its own over the facts and texts that carry their name in front.
     /// The permissions are the scene's: `services: "clock"` for `service clock`.
@@ -522,6 +551,7 @@ impl LuauScript {
             return;
         }
         let who = self.owner();
+        self.offer_pairing();
         let pending: Vec<crate::scene::Service> = {
             let c = self.c.lock().unwrap();
             c.services.iter().filter(|s| !c.subscribed.contains(&s.alias)).cloned().collect()
@@ -1384,6 +1414,9 @@ impl Script for LuauScript {
         match e {
             // The file is executed right on the logic's thread, with the scene delivered.
             Event::Alarm("start") | Event::ReloadLogic => {
+                // Before the file runs: a `bluetooth.connect` at its top level
+                // would otherwise pair as if nobody could be asked.
+                self.offer_pairing();
                 self.load_script();
                 self.subscribe_services();
             }
