@@ -17,8 +17,9 @@
 //! never the one the scene draws on): wlr-screencopy, which wlroots
 //! compositors, Hyprland, niri and pleamar-wm ship, and ext-image-copy-capture
 //! with its output source where the compositor has it. A pixel is asked of
-//! wlr-screencopy first, as a region one logical unit wide (the compositor
-//! scales and turns it); a freeze, of ext-image-copy-capture first. Either one
+//! wlr-screencopy first, as the region of the one logical unit the point is in
+//! (the compositor scales and turns it), and the pixel inside it chosen by
+//! where in the unit the point falls; a freeze, of ext-image-copy-capture first. Either one
 //! alone is enough. xdg-output says where each monitor is and how big, in
 //! logical units.
 //!
@@ -140,8 +141,8 @@ struct Output {
 /// The copy under way, as far as it has got.
 #[derive(Default)]
 struct Shot {
-    /// The layouts the compositor offers: format and size.
-    offers: Vec<(wl_shm::Format, (u32, u32))>,
+    /// The layouts the compositor offers: format, size, bytes a row.
+    offers: Vec<(wl_shm::Format, (u32, u32), u32)>,
     /// wlr: every layout said (`buffer_done`, or the first one on version 1 and 2).
     described: bool,
     /// ext: the size and the formats, until `done` makes them offers.
@@ -220,32 +221,35 @@ impl Link {
 
     fn pixel(&mut self, x: f64, y: f64, output: Option<&str>) -> Result<String, Asked> {
         self.sync()?;
-        let (o, lx, ly) = match output {
-            Some(name) => (self.output(name)?, x.floor() as i32, y.floor() as i32),
+        // The point inside its monitor, in logical units, fraction kept: on a
+        // scaled monitor one unit is several pixels, and they can differ.
+        let (o, fx, fy) = match output {
+            Some(name) => (self.output(name)?, x, y),
             None => {
-                let at = (x.floor() as i32, y.floor() as i32);
                 let rects: Vec<_> = self.state.outputs.iter().map(|o| (o.at, o.size)).collect();
-                let k = holding(&rects, at).ok_or_else(|| Asked::No(format!("no monitor holds the point {x}, {y}")))?;
+                let k = holding(&rects, (x.floor() as i32, y.floor() as i32)).ok_or_else(|| Asked::No(format!("no monitor holds the point {x}, {y}")))?;
                 let o = &self.state.outputs[k];
-                (o, at.0 - o.at.0, at.1 - o.at.1)
+                (o, x - o.at.0 as f64, y - o.at.1 as f64)
             }
         };
+        let (lx, ly) = (fx.floor() as i32, fy.floor() as i32);
         if lx < 0 || ly < 0 || lx >= o.size.0 || ly >= o.size.1 {
             return Err(Asked::No(format!("{x}, {y} is outside the monitor '{}' ({} × {})", o.name, o.size.0, o.size.1)));
         }
         let (wl, size) = (o.wl.clone(), o.size);
         if let Some(wlr) = self.state.wlr.clone() {
-            // One logical unit: however many pixels the compositor makes of it,
-            // they are the same colour; the middle one.
+            // The unit the point is in, as the compositor scales it; the copy
+            // comes back upright, so where in the unit the point falls picks
+            // the pixel without turning it.
             let frame = wlr.capture_output_region(0, &wl, lx, ly, 1, 1, &self.qh, ());
             let (px, w, h) = self.copy_wlr(frame, &wl)?;
-            return Ok(hex(&px[((h / 2) * w + w / 2) as usize * 4..]));
+            let (sx, sy) = pick((w, h), (1.0, 1.0), (fx - lx as f64, fy - ly as f64));
+            return Ok(hex(&px[(sy * w + sx) as usize * 4..]));
         }
+        // The whole monitor, upright, in its pixels, which may be more than its units.
         let (px, w, h) = self.copy_ext(&wl)?;
-        // In the monitor's pixels, which may be more than its units.
-        let sx = ((lx as f64 + 0.5) * w as f64 / size.0.max(1) as f64) as u32;
-        let sy = ((ly as f64 + 0.5) * h as f64 / size.1.max(1) as f64) as u32;
-        Ok(hex(&px[(sy.min(h - 1) * w + sx.min(w - 1)) as usize * 4..]))
+        let (sx, sy) = pick((w, h), (size.0 as f64, size.1 as f64), (fx, fy));
+        Ok(hex(&px[(sy * w + sx) as usize * 4..]))
     }
 
     fn freeze(&mut self, name: &str) -> Result<String, Asked> {
@@ -329,15 +333,15 @@ impl Link {
             return Err(Asked::No(why));
         }
         let shm = self.state.shm.clone().ok_or_else(|| Asked::No("no shared memory".into()))?;
-        let Some(&(format, size)) = self.state.shot.offers.iter().find(|(f, _)| reads(*f)) else {
+        let Some(&(format, size, stride)) = self.state.shot.offers.iter().find(|(f, ..)| reads(*f)) else {
             return Err(Asked::No("the compositor offers the screen in no layout of 8 bits a colour".into()));
         };
-        Shm::new(&shm, size, format, &self.qh).ok_or_else(|| Asked::No("no memory for the copy".into()))
+        Shm::new(&shm, size, stride, format, &self.qh).ok_or_else(|| Asked::No("no memory for the copy".into()))
     }
 
     fn finish(&mut self, shm: &Shm, transform: u32) -> (Vec<u8>, u32, u32) {
         let (w, h) = shm.size;
-        let mut px = shm.bytes().to_vec();
+        let mut px = packed(shm.bytes(), w, h, shm.stride);
         if matches!(shm.format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888) {
             for p in px.chunks_exact_mut(4) {
                 p.swap(0, 2);
@@ -353,6 +357,25 @@ impl Link {
 /// The layouts read here: 8 bits a colour, in either order.
 fn reads(f: wl_shm::Format) -> bool {
     matches!(f, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 | wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888)
+}
+
+/// Which pixel of a `w` × `h` copy of a region `size` logical units big holds
+/// the point `at` inside the region (both upright): its share of the region,
+/// times the copy's pixels. At scale 2 a unit is 2 × 2 pixels; at 1.5 a 2 × 2
+/// region is 3 × 3.
+fn pick((w, h): (u32, u32), size: (f64, f64), at: (f64, f64)) -> (u32, u32) {
+    let one = |at: f64, size: f64, n: u32| ((at / size.max(f64::MIN_POSITIVE) * n as f64).floor().max(0.0) as u32).min(n.saturating_sub(1));
+    (one(at.0, size.0, w), one(at.1, size.1, h))
+}
+
+/// The copy's rows without the padding a compositor may put after each:
+/// `w * 4` bytes a row, `h` rows.
+fn packed(bytes: &[u8], w: u32, h: u32, stride: u32) -> Vec<u8> {
+    let row = w as usize * 4;
+    if stride as usize == row {
+        return bytes[..row * h as usize].to_vec();
+    }
+    bytes.chunks(stride as usize).take(h as usize).flat_map(|r| &r[..row]).copied().collect()
 }
 
 /// `"#rrggbb"` of the pixel at the start of `px` (blue, green, red, alpha).
@@ -475,9 +498,10 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
         let shot = &mut e.shot;
         match ev {
             E::Buffer { format: WEnum::Value(format), width, height, stride } => {
-                // A buffer of ours is `width * 4` a row: an offer of any other is no use.
-                if stride == width * 4 {
-                    shot.offers.push((format, (width, height)));
+                // The buffer is made with the stride asked for, padding and all;
+                // `packed` takes the padding off.
+                if stride >= width * 4 {
+                    shot.offers.push((format, (width, height), stride));
                 }
                 // Before version 3 there is no `buffer_done`: this is all.
                 if frame.version() < 3 {
@@ -501,7 +525,8 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
             copy_session::Event::ShmFormat { format: WEnum::Value(f) } => shot.formats.push(f),
             copy_session::Event::Done => {
                 if let Some(size) = shot.size {
-                    shot.offers = shot.formats.iter().map(|&f| (f, size)).collect();
+                    // ext lets the client say how wide a row is: no padding.
+                    shot.offers = shot.formats.iter().map(|&f| (f, size, size.0 * 4)).collect();
                 }
                 shot.described = true;
             }
@@ -614,6 +639,52 @@ mod tests {
         }
         let (px, ..) = upright(marked(3, 2), 3, 2, 4);
         assert_eq!(at(&px, 3, 0, 0), (2, 0));
+    }
+
+    #[test]
+    fn the_pixel_is_the_one_the_point_is_on_at_scale_2() {
+        // One unit at scale 2: a 2 × 2 copy. Its top left and bottom right
+        // are different pixels, and different colours where an edge runs
+        // through the unit.
+        let unit = marked(2, 2);
+        let (sx, sy) = pick((2, 2), (1.0, 1.0), (0.1, 0.1));
+        assert_eq!(at(&unit, 2, sx, sy), (0, 0));
+        let (sx, sy) = pick((2, 2), (1.0, 1.0), (0.75, 0.75));
+        assert_eq!(at(&unit, 2, sx, sy), (1, 1));
+        let (sx, sy) = pick((2, 2), (1.0, 1.0), (0.75, 0.25));
+        assert_eq!(at(&unit, 2, sx, sy), (1, 0));
+    }
+
+    #[test]
+    fn the_pixel_is_the_one_the_point_is_on_at_scale_one_and_a_half() {
+        // A 2 × 2 region at 1.5 is 3 × 3: unit 0 is pixels 0 and half of 1,
+        // unit 1 the other half of 1 and 2.
+        let region = marked(3, 3);
+        let seen = |x: f64, y: f64| {
+            let (sx, sy) = pick((3, 3), (2.0, 2.0), (x, y));
+            at(&region, 3, sx, sy)
+        };
+        assert_eq!(seen(0.2, 0.2), (0, 0));
+        assert_eq!(seen(0.8, 0.2), (1, 0));
+        assert_eq!(seen(1.0, 1.0), (1, 1));
+        assert_eq!(seen(1.9, 1.4), (2, 2));
+        // The edges stay inside the copy.
+        assert_eq!(seen(2.0, 2.0), (2, 2));
+        assert_eq!(seen(-0.1, 0.0), (0, 0));
+    }
+
+    #[test]
+    fn padded_rows_are_packed() {
+        // Two rows of 3 pixels, each row 16 bytes where 12 are pixels.
+        let mut bytes = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..3u8 {
+                bytes.extend([x, y, 0, 255]);
+            }
+            bytes.extend([0xee; 4]);
+        }
+        assert_eq!(packed(&bytes, 3, 2, 16), marked(3, 2));
+        assert_eq!(packed(&marked(3, 2), 3, 2, 12), marked(3, 2));
     }
 
     #[test]

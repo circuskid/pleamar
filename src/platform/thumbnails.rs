@@ -318,6 +318,8 @@ pub(super) struct Shm {
     map: *mut u8,
     len: usize,
     pub(super) size: (u32, u32),
+    /// Bytes a row: `size.0 * 4`, or more where the compositor pads its rows.
+    pub(super) stride: u32,
     pub(super) format: wl_shm::Format,
 }
 
@@ -334,13 +336,15 @@ impl Drop for Shm {
 }
 
 impl Shm {
-    pub(super) fn new<D>(shm: &wl_shm::WlShm, size: (u32, u32), format: wl_shm::Format, qh: &QueueHandle<D>) -> Option<Shm>
+    pub(super) fn new<D>(shm: &wl_shm::WlShm, size: (u32, u32), stride: u32, format: wl_shm::Format, qh: &QueueHandle<D>) -> Option<Shm>
     where
         D: Dispatch<wl_shm_pool::WlShmPool, ()> + Dispatch<wl_buffer::WlBuffer, ()> + 'static,
     {
         let (w, h) = size;
-        let stride = w as usize * 4;
-        let len = stride * h as usize;
+        if stride < w * 4 {
+            return None;
+        }
+        let len = stride as usize * h as usize;
         if len == 0 {
             return None;
         }
@@ -363,10 +367,10 @@ impl Shm {
         }
         let pool = shm.create_pool(fd.as_fd(), len as i32, qh, ());
         let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, qh, ());
-        Some(Shm { buffer, pool, map: map as *mut u8, len, size, format })
+        Some(Shm { buffer, pool, map: map as *mut u8, len, size, stride, format })
     }
 
-    /// What the compositor left in it, `size.0 * 4` bytes a row.
+    /// What the compositor left in it, `stride` bytes a row.
     pub(super) fn bytes(&self) -> &[u8] {
         // SAFETY: mapped by `new` with this length, for as long as `self`.
         unsafe { std::slice::from_raw_parts(self.map, self.len) }
@@ -685,7 +689,7 @@ impl State {
             // window may be see-through), XRGB if not.
             if c.shm.as_ref().is_none_or(|s| s.size != size) {
                 let format = if c.formats.contains(&wl_shm::Format::Argb8888) { wl_shm::Format::Argb8888 } else { wl_shm::Format::Xrgb8888 };
-                c.shm = Shm::new(&shm, size, format, qh);
+                c.shm = Shm::new(&shm, size, size.0 * 4, format, qh);
             }
             let Some(s) = &c.shm else { continue };
             let frame = c.session.create_frame(qh, k);
