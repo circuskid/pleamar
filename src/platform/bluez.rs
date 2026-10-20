@@ -341,6 +341,13 @@ fn put(attempt: u64, kind: Kind, device: OwnedObjectPath, code: String, reply: O
         r.give(Answer::Over);
     }
     tell();
+    // The last scene that shows it may have gone between the caller's `asks()`
+    // and now; `handles` found nothing to withdraw then, so it is withdrawn here.
+    if !asks()
+        && let Some(a) = withdraw(|a| a.id == id, Answer::Over).filter(|a| a.reply.is_none())
+    {
+        std::thread::spawn(move || call_off(&a.device));
+    }
     id
 }
 
@@ -756,6 +763,19 @@ mod tests {
             std::thread::yield_now();
         }
         waiting
+    }
+
+    #[test]
+    fn a_question_put_after_the_last_scene_went_is_not_left_waiting() {
+        let _one_at_a_time = ONE.lock().unwrap();
+        // `ask` saw a scene; it went before the question was put, so `handles`
+        // had nothing to withdraw.
+        handles("Test", true);
+        handles("Test", false);
+        let reply = Arc::new(Reply::default());
+        put(1, Kind::Confirm, OwnedObjectPath::try_from(DEV).unwrap(), "333333".into(), Some(reply.clone()));
+        assert!(ASKED.lock().unwrap().is_none());
+        assert_eq!(zbus::block_on(Wait(reply)), Answer::Over);
     }
 
     #[test]
