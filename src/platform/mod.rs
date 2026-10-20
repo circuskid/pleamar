@@ -42,7 +42,7 @@ pub enum SysValue {
 ///  · `battery`    → `{ present, percent, charging }`
 ///  · `network`    → `{ online, kind = "wired" | "wifi" | "none", name, strength, wifi, networks }` (see `networkmanager`)
 ///  · `bluetooth`  → `{ present, powered, discovering, devices }` (see `bluez`)
-///  · `media`      → `{ playing, title, artist, album, length, position, rate, art, player, players }`, or `{ player = "" }` if nothing is playing
+///  · `media`      → `{ playing, title, artist, album, length, position, rate, can_seek, art, player, players }`, or `{ player = "" }` if nothing is playing
 ///  · `clock`      → `{ hour, minute, second, day, month, year, weekday, time, date }`, when the minute changes
 ///  · `clock.seconds` → the same, every second
 ///  · `files:x.json` → the text of that file when it changes

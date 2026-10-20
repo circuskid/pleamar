@@ -454,6 +454,12 @@ Paused, `elapsed` is just the position the pause reported. A scene that names
 not. With reduced motion `time` stops, and the bar moves only when the player
 reports.
 
+To drag it, the logic sends the player there: `sys.call("media.seek", seconds)`,
+with `services: "media.seek"` beside `"media"`, and `media.step` for a few
+seconds either way from a key. Where `can_seek` is false the player will not
+move (a live stream), so the bar is better left still. The new `position`
+comes back as a report, and `on change song.position` catches it like any other.
+
 ## Every window, with its picture
 
 An overview, a switcher: each window of the desktop —the scene's own or any

@@ -31,7 +31,7 @@ scene Services {
         wifi: bool
     }
     service bluetooth as bt { present: bool; powered: bool; discovering: bool }
-    service media as song { playing: bool; title: text; artist: text; album: text; length: number; position: number; rate: number; art: text; player: text }
+    service media as song { playing: bool; title: text; artist: text; album: text; length: number; position: number; rate: number; can_seek: bool; art: text; player: text }
     service window as win { title: text; class: text }
     service thumbnails as thumbs { capturing: bool }
 
