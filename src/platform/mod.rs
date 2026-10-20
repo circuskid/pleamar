@@ -726,16 +726,31 @@ fn say_at(path: &std::path::Path, scene: &str, command: &str) -> Result<(), Stri
     // reading blocks, and a native call cannot be cut off by the logic's
     // patience: so the exchange goes on a thread of its own, and the logic
     // waits for it no longer than that. A thread left blocked ends when that
-    // scene takes the call or goes away.
+    // scene takes the call or goes away, without writing: an error the logic
+    // was given means the order was not delivered, and calling again does not
+    // deliver it twice. Who goes first decides, under one lock: the thread
+    // starting to write, or the logic giving up.
+    const WAITING: u8 = 0;
+    const WRITING: u8 = 1;
+    const GIVEN_UP: u8 = 2;
     let until = Instant::now() + Duration::from_secs(1);
     let (tx, rx) = std::sync::mpsc::channel::<Result<bool, String>>();
-    let (path, who, command) = (path.to_owned(), scene.to_owned(), command.to_owned());
+    let phase = std::sync::Arc::new(std::sync::Mutex::new(WAITING));
+    let (path, who, command, worker) = (path.to_owned(), scene.to_owned(), command.to_owned(), std::sync::Arc::clone(&phase));
     std::thread::spawn(move || {
         // No socket, or one left behind by a scene that ended: nobody to tell.
         let Ok(mut s) = std::os::unix::net::UnixStream::connect(&path) else {
             let _ = tx.send(Err(format!("the scene '{who}' is not running")));
             return;
         };
+        {
+            let mut p = worker.lock().unwrap();
+            if *p == GIVEN_UP || Instant::now() >= until {
+                *p = GIVEN_UP;
+                return;
+            }
+            *p = WRITING;
+        }
         let _ = s.set_write_timeout(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))));
         if let Err(e) = writeln!(s, "{command}") {
             let _ = tx.send(Err(format!("'{who}': {e}")));
@@ -767,11 +782,20 @@ fn say_at(path: &std::path::Path, scene: &str, command: &str) -> Result<(), Stri
     });
     let left = || until.saturating_duration_since(Instant::now());
     // Not even taken within the second: the order did not get there.
-    match rx.recv_timeout(left()) {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(format!("the scene '{scene}' did not take the order within a second")),
-    }
+    let delivered = match rx.recv_timeout(left()) {
+        Err(_) => {
+            let mut p = phase.lock().unwrap();
+            if *p == WAITING {
+                *p = GIVEN_UP;
+                return Err(format!("the scene '{scene}' did not take the order within a second"));
+            }
+            drop(p);
+            // The write began in time and has until the second to end: its outcome comes.
+            rx.recv_timeout(Duration::from_millis(100)).map_err(|_| format!("'{scene}' was still being told when the second ran out: it may have the order"))?
+        }
+        Ok(r) => r,
+    };
+    delivered?;
     // Taken: only a `? …` is an error; one still waiting at the second is not.
     match rx.recv_timeout(left() + Duration::from_millis(50)) {
         Ok(Err(e)) => Err(e),
@@ -1237,6 +1261,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_scene_that_takes_no_calls_holds_the_caller_one_second_in_all() {
         use std::os::fd::AsRawFd;
         let dir = std::env::temp_dir().join(format!("pleamar-say-full-{}", std::process::id()));
@@ -1258,6 +1283,21 @@ pub(crate) mod tests {
         assert_eq!(say_at(&path, "bar", "emit x"), Err("the scene 'bar' did not take the order within a second".into()));
         let took = t.elapsed();
         assert!(took < std::time::Duration::from_millis(1500), "held for {took:?}");
+        // The scene comes back and takes its calls: the order it was told failed never arrives.
+        listener.set_nonblocking(true).unwrap();
+        let back = std::time::Instant::now();
+        while back.elapsed() < std::time::Duration::from_millis(500) {
+            match listener.accept() {
+                Ok((mut c, _)) => {
+                    c.set_nonblocking(false).unwrap();
+                    c.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+                    let mut heard = String::new();
+                    let _ = std::io::Read::read_to_string(&mut c, &mut heard);
+                    assert!(!heard.contains("emit x"), "delivered after the caller was told it was not");
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -420,7 +420,9 @@ names the ones that are, and so is an order it does not understand. One call
 is one command. The scene reached is the one `--say` reaches: the one shown on
 the caller's display, or, with none there, one shown on another, which the
 caller's log then says. Nothing is waited for beyond a second in all: a scene
-that has not taken the order by then is an error, and a
+that has not taken the order by then is an error, and is not told it later
+(unless the error says it may have the order, the second having run out
+while it was being written), and a
 `wait` still waiting then, or a `watch`, is not an error: it says nothing about
 whether what was waited for came. `"say:*"` is shown with a ⚠ at startup: it
 can tell any scene anything, `quit` too. Two scenes that each answer the
