@@ -17,9 +17,9 @@
 //! never the one the scene draws on): wlr-screencopy, which wlroots
 //! compositors, Hyprland, niri and pleamar-wm ship, and ext-image-copy-capture
 //! with its output source where the compositor has it. A pixel is asked of
-//! wlr-screencopy first, as the region of the one logical unit the point is in
-//! (the compositor scales and turns it), and the pixel inside it chosen by
-//! where in the unit the point falls; a freeze, of ext-image-copy-capture first. Either one
+//! wlr-screencopy first, as a small region around the point, which is made upright
+//! here; the pixel inside it is the one the point is on, from the monitor's
+//! scale. A freeze is asked of ext-image-copy-capture first. Either one
 //! alone is enough. xdg-output says where each monitor is and how big, in
 //! logical units.
 //!
@@ -51,8 +51,10 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-/// How long the compositor has to answer one question.
+/// How long the compositor has to answer one copy.
 const WAIT: Duration = Duration::from_secs(2);
+/// How long it has to answer a plain round trip.
+const SYNC_WAIT: Duration = Duration::from_millis(500);
 
 /// Every monitor's last freeze, by its name.
 static FROZEN: Mutex<Option<HashMap<String, Arc<Frame>>>> = Mutex::new(None);
@@ -122,6 +124,9 @@ struct State {
     sources: Option<ExtOutputImageCaptureSourceManagerV1>,
     copies: Option<ExtImageCopyCaptureManagerV1>,
     xdg: Option<ZxdgOutputManagerV1>,
+    /// Counts monitors coming and going, so that a turn with the compositor
+    /// can tell whether one came or went during it.
+    changes: u64,
     synced: bool,
     shot: Shot,
 }
@@ -136,6 +141,27 @@ struct Output {
     at: (i32, i32),
     size: (i32, i32),
     transform: u32,
+    /// The current mode, in pixels, before the transform.
+    mode: Option<(i32, i32)>,
+    /// `wl_output.scale`: whole numbers only, used where there is no mode.
+    scale: i32,
+}
+
+impl Output {
+    /// Pixels a logical unit: the mode over the logical size, to the nearest
+    /// 1/120 (the steps a fractional scale is given in).
+    fn scale(&self) -> f64 {
+        let turned = self.transform & 1 == 1;
+        match self.mode {
+            Some((w, h)) if self.size.0 > 0 => snap(if turned { h } else { w } as f64 / self.size.0 as f64),
+            _ => self.scale.max(1) as f64,
+        }
+    }
+
+    /// Everything the questions need has been said.
+    fn described(&self) -> bool {
+        !self.name.is_empty() && self.size.0 > 0 && self.size.1 > 0
+    }
 }
 
 /// The copy under way, as far as it has got.
@@ -157,27 +183,22 @@ struct Shot {
 impl Link {
     fn connect() -> Result<Link, String> {
         let connection = Connection::connect_to_env().map_err(|_| "capture needs a Wayland compositor".to_string())?;
-        let mut queue = connection.new_event_queue::<State>();
+        let queue = connection.new_event_queue::<State>();
         let qh = queue.handle();
         connection.display().get_registry(&qh, ());
-        let mut state = State::default();
-        queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-        // Monitors announced before the xdg-output manager.
-        if let Some(xdg) = &state.xdg {
-            for o in state.outputs.iter_mut().filter(|o| o.xdg.is_none()) {
-                o.xdg = Some(xdg.get_xdg_output(&o.wl, &qh, o.global));
-            }
-        }
-        queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-        if state.shm.is_none() || (state.wlr.is_none() && (state.sources.is_none() || state.copies.is_none())) {
+        let mut link = Link { connection, queue, qh, state: State::default() };
+        // Bounded like every other wait: a compositor that never answers is an error, not a hang.
+        link.settle().map_err(|(Asked::No(why) | Asked::Lost(why))| why)?;
+        let s = &link.state;
+        if s.shm.is_none() || (s.wlr.is_none() && (s.sources.is_none() || s.copies.is_none())) {
             return Err("this compositor does not let a program copy the screen (neither wlr-screencopy nor ext-image-copy-capture)".into());
         }
-        Ok(Link { connection, queue, qh, state })
+        Ok(link)
     }
 
-    /// Answers until `done` says so, or `WAIT` passes.
-    fn wait(&mut self, done: impl Fn(&State) -> bool) -> Result<(), Asked> {
-        let until = Instant::now() + WAIT;
+    /// Answers until `done` says so, or `within` passes.
+    fn wait(&mut self, within: Duration, done: impl Fn(&State) -> bool) -> Result<(), Asked> {
+        let until = Instant::now() + within;
         let lost = |e: &dyn std::fmt::Display| Asked::Lost(format!("the compositor's connection ended: {e}"));
         loop {
             self.queue.dispatch_pending(&mut self.state).map_err(|e| lost(&e))?;
@@ -186,7 +207,8 @@ impl Link {
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(Asked::Lost("the compositor did not answer".into()));
+                // Slow is not broken: the connection stays.
+                return Err(Asked::No("the compositor did not answer in time".into()));
             }
             self.connection.flush().map_err(|e| lost(&e))?;
             let Some(guard) = self.queue.prepare_read() else { continue };
@@ -204,12 +226,31 @@ impl Link {
         }
     }
 
-    /// The monitors as they are now: one turn with the compositor, so that one
-    /// unplugged a moment ago is not asked for.
+    /// One turn with the compositor.
     fn sync(&mut self) -> Result<(), Asked> {
         self.state.synced = false;
         self.connection.display().sync(&self.qh, ());
-        self.wait(|s| s.synced)
+        self.wait(SYNC_WAIT, |s| s.synced)
+    }
+
+    /// The monitors as they are now, so that one unplugged a moment ago is not
+    /// asked for. A monitor announced during a turn is only asked about after
+    /// it (its name, where it is), so turns go on until none came or went and
+    /// each one has said what it is.
+    fn settle(&mut self) -> Result<(), Asked> {
+        for _ in 0..4 {
+            let before = self.state.changes;
+            if let Some(xdg) = &self.state.xdg {
+                for o in self.state.outputs.iter_mut().filter(|o| o.xdg.is_none()) {
+                    o.xdg = Some(xdg.get_xdg_output(&o.wl, &self.qh, o.global));
+                }
+            }
+            self.sync()?;
+            if self.state.changes == before && self.state.outputs.iter().all(Output::described) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn output(&self, name: &str) -> Result<&Output, Asked> {
@@ -220,7 +261,7 @@ impl Link {
     }
 
     fn pixel(&mut self, x: f64, y: f64, output: Option<&str>) -> Result<String, Asked> {
-        self.sync()?;
+        self.settle()?;
         // The point inside its monitor, in logical units, fraction kept: on a
         // scaled monitor one unit is several pixels, and they can differ.
         let (o, fx, fy) = match output {
@@ -236,26 +277,27 @@ impl Link {
         if lx < 0 || ly < 0 || lx >= o.size.0 || ly >= o.size.1 {
             return Err(Asked::No(format!("{x}, {y} is outside the monitor '{}' ({} × {})", o.name, o.size.0, o.size.1)));
         }
-        let (wl, size) = (o.wl.clone(), o.size);
+        let (wl, size, scale, transform) = (o.wl.clone(), o.size, o.scale(), o.transform);
         if let Some(wlr) = self.state.wlr.clone() {
-            // The unit the point is in, as the compositor scales it; the copy
-            // comes back upright, so where in the unit the point falls picks
-            // the pixel without turning it.
-            let frame = wlr.capture_output_region(0, &wl, lx, ly, 1, 1, &self.qh, ());
-            let (px, w, h) = self.copy_wlr(frame, &wl)?;
-            let (sx, sy) = pick((w, h), (1.0, 1.0), (fx - lx as f64, fy - ly as f64));
-            return Ok(hex(&px[(sy * w + sx) as usize * 4..]));
+            // A region around the point, laid on the scale's pixel grid so that
+            // however the compositor rounds it, it starts on a known pixel.
+            let (rx, ry) = reversed(transform);
+            let (ax, ay) = (Axis::around(fx, size.0, scale, rx), Axis::around(fy, size.1, scale, ry));
+            let frame = wlr.capture_output_region(0, &wl, ax.start, ay.start, ax.len, ay.len, &self.qh, ());
+            let (px, w, h, _) = self.copy_wlr(frame, &wl)?;
+            return Ok(hex(&px[(ay.index(h) * w + ax.index(w)) as usize * 4..]));
         }
         // The whole monitor, upright, in its pixels, which may be more than its units.
-        let (px, w, h) = self.copy_ext(&wl)?;
-        let (sx, sy) = pick((w, h), (size.0 as f64, size.1 as f64), (fx, fy));
-        Ok(hex(&px[(sy * w + sx) as usize * 4..]))
+        let (px, w, h, applied) = self.copy_ext(&wl)?;
+        let (rx, ry) = reversed(applied);
+        let (ax, ay) = (Axis::whole(fx, size.0, scale, rx), Axis::whole(fy, size.1, scale, ry));
+        Ok(hex(&px[(ay.index(h) * w + ax.index(w)) as usize * 4..]))
     }
 
     fn freeze(&mut self, name: &str) -> Result<String, Asked> {
-        self.sync()?;
+        self.settle()?;
         let wl = self.output(name)?.wl.clone();
-        let (pixels, width, height) = match (&self.state.sources, &self.state.copies) {
+        let (pixels, width, height, _) = match (&self.state.sources, &self.state.copies) {
             (Some(_), Some(_)) => self.copy_ext(&wl)?,
             _ => {
                 let frame = self.state.wlr.as_ref().unwrap().capture_output(0, &wl, &self.qh, ());
@@ -268,10 +310,11 @@ impl Link {
         Ok(format!("capture:{name}?{version}"))
     }
 
-    /// A wlr-screencopy frame, copied and made upright: blue, green, red, alpha.
-    fn copy_wlr(&mut self, frame: ZwlrScreencopyFrameV1, wl: &wl_output::WlOutput) -> Result<(Vec<u8>, u32, u32), Asked> {
+    /// A wlr-screencopy frame, copied and made upright: blue, green, red,
+    /// alpha; and the transform it was made upright from.
+    fn copy_wlr(&mut self, frame: ZwlrScreencopyFrameV1, wl: &wl_output::WlOutput) -> Result<Copy, Asked> {
         self.state.shot = Shot::default();
-        let got = self.wait(|s| s.shot.described || s.shot.failed.is_some());
+        let got = self.wait(WAIT, |s| s.shot.described || s.shot.failed.is_some());
         let shm = got.and_then(|_| self.buffer());
         let shm = match shm {
             Ok(shm) => shm,
@@ -281,19 +324,23 @@ impl Link {
             }
         };
         frame.copy(&shm.buffer);
-        let got = self.wait(|s| s.shot.ready || s.shot.failed.is_some());
+        let got = self.wait(WAIT, |s| s.shot.ready || s.shot.failed.is_some());
         frame.destroy();
         got?;
         if let Some(why) = self.state.shot.failed.take() {
             return Err(Asked::No(why));
         }
-        // The monitor's own transform, as grim does: wlr-screencopy does not say it.
-        let transform = self.state.outputs.iter().find(|o| &o.wl == wl).map_or(0, |o| o.transform);
+        // wlr-screencopy does not say it: the monitor's own, as grim does.
+        let transform = self.transform_of(wl);
         Ok(self.finish(&shm, transform))
     }
 
+    fn transform_of(&self, wl: &wl_output::WlOutput) -> u32 {
+        self.state.outputs.iter().find(|o| &o.wl == wl).map_or(0, |o| o.transform)
+    }
+
     /// An ext-image-copy-capture copy of the whole monitor, made upright.
-    fn copy_ext(&mut self, wl: &wl_output::WlOutput) -> Result<(Vec<u8>, u32, u32), Asked> {
+    fn copy_ext(&mut self, wl: &wl_output::WlOutput) -> Result<Copy, Asked> {
         let (Some(sources), Some(copies)) = (self.state.sources.clone(), self.state.copies.clone()) else {
             return Err(Asked::No("this compositor copies no whole monitor".into()));
         };
@@ -304,7 +351,7 @@ impl Link {
             session.destroy();
             source.destroy();
         };
-        let shm = self.wait(|s| s.shot.described || s.shot.failed.is_some()).and_then(|_| self.buffer());
+        let shm = self.wait(WAIT, |s| s.shot.described || s.shot.failed.is_some()).and_then(|_| self.buffer());
         let shm = match shm {
             Ok(shm) => shm,
             Err(e) => {
@@ -316,14 +363,16 @@ impl Link {
         frame.attach_buffer(&shm.buffer);
         frame.damage_buffer(0, 0, shm.size.0 as i32, shm.size.1 as i32);
         frame.capture();
-        let got = self.wait(|s| s.shot.ready || s.shot.failed.is_some());
+        let got = self.wait(WAIT, |s| s.shot.ready || s.shot.failed.is_some());
         frame.destroy();
         ended(source, session);
         got?;
         if let Some(why) = self.state.shot.failed.take() {
             return Err(Asked::No(why));
         }
-        let transform = self.state.shot.transform.unwrap_or(0);
+        // The spec has the frame say it before `ready`; one that does not is
+        // taken to be laid out as the monitor is, as wlr-screencopy is.
+        let transform = self.state.shot.transform.unwrap_or_else(|| self.transform_of(wl));
         Ok(self.finish(&shm, transform))
     }
 
@@ -339,7 +388,7 @@ impl Link {
         Shm::new(&shm, size, stride, format, &self.qh).ok_or_else(|| Asked::No("no memory for the copy".into()))
     }
 
-    fn finish(&mut self, shm: &Shm, transform: u32) -> (Vec<u8>, u32, u32) {
+    fn finish(&mut self, shm: &Shm, transform: u32) -> Copy {
         let (w, h) = shm.size;
         let mut px = packed(shm.bytes(), w, h, shm.stride);
         if matches!(shm.format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888) {
@@ -350,22 +399,86 @@ impl Link {
         if self.state.shot.y_invert {
             px = flip_rows(&px, w, h);
         }
-        upright(px, w, h, transform)
+        let (px, w, h) = upright(px, w, h, transform);
+        (px, w, h, transform)
+    }
+}
+
+/// Upright pixels, their width and height, and the transform undone.
+type Copy = (Vec<u8>, u32, u32, u32);
+
+/// A scale to the nearest 1/120.
+fn snap(scale: f64) -> f64 {
+    ((scale * 120.0).round() / 120.0).max(1.0 / 120.0)
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a.abs() } else { gcd(b, a % b) }
+}
+
+/// Which way each upright axis (x, y) runs in the copy as the compositor lays
+/// it out: `true` where it runs backwards. Read off `upright` itself.
+fn reversed(transform: u32) -> (bool, bool) {
+    let marked: Vec<u8> = (0..2u8).flat_map(|y| (0..2u8).flat_map(move |x| [x, y, 0, 0])).collect();
+    let (px, w, _) = upright(marked, 2, 2, transform);
+    let at = |x: usize, y: usize| (px[(y * w as usize + x) * 4], px[(y * w as usize + x) * 4 + 1]);
+    let falls = |a: (u8, u8), b: (u8, u8)| b.0 < a.0 || b.1 < a.1;
+    (falls(at(0, 0), at(1, 0)), falls(at(0, 0), at(0, 1)))
+}
+
+/// One axis of a copy: the logical span asked for, and where in the copy the
+/// point's pixel is. Counted in the compositor's layout (from the far end on a
+/// reversed axis), where its pixels start at 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Axis {
+    /// The span asked for, in upright logical units.
+    start: i32,
+    len: i32,
+    /// The point's pixel, from the span's first pixel, in the compositor's layout.
+    offset: i64,
+    reversed: bool,
+}
+
+impl Axis {
+    /// The point `at` along a monitor `whole` units long, and its pixel.
+    fn point(at: f64, whole: i32, scale: f64, reversed: bool) -> (f64, i64) {
+        let c = if reversed { whole as f64 - at } else { at };
+        // A pixel holds its start, not its end; seen from the far end, the other way.
+        let pixel = if reversed { (c * scale).ceil() as i64 - 1 } else { (c * scale).floor() as i64 };
+        (c, pixel)
+    }
+
+    /// The whole monitor.
+    fn whole(at: f64, whole: i32, scale: f64, reversed: bool) -> Axis {
+        let (_, pixel) = Axis::point(at, whole, scale, reversed);
+        Axis { start: 0, len: whole, offset: pixel, reversed }
+    }
+
+    /// A span around the point that starts and ends on whole pixels at this
+    /// scale, so that a compositor rounding its ends to pixels (wlroots rounds,
+    /// pleamar-wm truncates) cannot move them: at 1.5 an even unit, at 1.25 a
+    /// fourth one.
+    fn around(at: f64, whole: i32, scale: f64, reversed: bool) -> Axis {
+        let (c, pixel) = Axis::point(at, whole, scale, reversed);
+        let unit = if reversed { c.ceil() as i64 - 1 } else { c.floor() as i64 };
+        let step = 120 / gcd((scale * 120.0).round() as i64, 120).max(1);
+        let from = (unit.div_euclid(step) * step).max(0);
+        let to = ((unit + step).div_euclid(step) * step).min(whole as i64).max(from + 1);
+        let first = (from as f64 * scale).round() as i64;
+        let start = if reversed { whole as i64 - to } else { from };
+        Axis { start: start as i32, len: (to - from) as i32, offset: pixel - first, reversed }
+    }
+
+    /// The pixel's place in an upright copy `n` pixels long.
+    fn index(&self, n: u32) -> u32 {
+        let i = self.offset.clamp(0, n.max(1) as i64 - 1) as u32;
+        if self.reversed { n - 1 - i } else { i }
     }
 }
 
 /// The layouts read here: 8 bits a colour, in either order.
 fn reads(f: wl_shm::Format) -> bool {
     matches!(f, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 | wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888)
-}
-
-/// Which pixel of a `w` × `h` copy of a region `size` logical units big holds
-/// the point `at` inside the region (both upright): its share of the region,
-/// times the copy's pixels. At scale 2 a unit is 2 × 2 pixels; at 1.5 a 2 × 2
-/// region is 3 × 3.
-fn pick((w, h): (u32, u32), size: (f64, f64), at: (f64, f64)) -> (u32, u32) {
-    let one = |at: f64, size: f64, n: u32| ((at / size.max(f64::MIN_POSITIVE) * n as f64).floor().max(0.0) as u32).min(n.saturating_sub(1));
-    (one(at.0, size.0, w), one(at.1, size.1, h))
 }
 
 /// The copy's rows without the padding a compositor may put after each:
@@ -435,7 +548,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_output" => {
                     let wl: wl_output::WlOutput = registry.bind(name, version.min(4), qh, name);
                     let xdg = e.xdg.as_ref().map(|m| m.get_xdg_output(&wl, qh, name));
-                    e.outputs.push(Output { global: name, wl, xdg, name: String::new(), at: (0, 0), size: (0, 0), transform: 0 });
+                    e.outputs.push(Output { global: name, wl, xdg, name: String::new(), at: (0, 0), size: (0, 0), transform: 0, mode: None, scale: 1 });
+                    e.changes += 1;
                 }
                 "zxdg_output_manager_v1" => e.xdg = Some(registry.bind(name, version.min(3), qh, ())),
                 "wl_shm" => e.shm = Some(registry.bind(name, 1, qh, ())),
@@ -447,6 +561,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             wl_registry::Event::GlobalRemove { name } => {
                 if let Some(k) = e.outputs.iter().position(|o| o.global == name) {
                     let o = e.outputs.remove(k);
+                    e.changes += 1;
+                    // Its last freeze goes with it: a whole monitor of memory.
+                    if let Some(frozen) = FROZEN.lock().unwrap().as_mut() {
+                        frozen.remove(&o.name);
+                    }
                     if let Some(x) = o.xdg {
                         x.destroy();
                     }
@@ -466,6 +585,8 @@ impl Dispatch<wl_output::WlOutput, u32> for State {
         match ev {
             wl_output::Event::Geometry { transform: WEnum::Value(t), .. } => o.transform = t as u32,
             wl_output::Event::Name { name } => o.name = name,
+            wl_output::Event::Mode { flags: WEnum::Value(f), width, height, .. } if f.contains(wl_output::Mode::Current) => o.mode = Some((width, height)),
+            wl_output::Event::Scale { factor } => o.scale = factor,
             _ => {}
         }
     }
@@ -546,7 +667,15 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
         match ev {
             copy_frame::Event::Transform { transform: WEnum::Value(t) } => shot.transform = Some(t as u32),
             copy_frame::Event::Ready => shot.ready = true,
-            copy_frame::Event::Failed { reason } => shot.failed = Some(format!("the compositor would not copy the monitor ({reason:?})")),
+            copy_frame::Event::Failed { reason } => {
+                use copy_frame::FailureReason as F;
+                let why = match reason {
+                    WEnum::Value(F::BufferConstraints) => "the copy's buffer no longer matches the monitor (it changed size or layout)",
+                    WEnum::Value(F::Stopped) => "the monitor stopped being copied (it went away)",
+                    _ => "an error the compositor did not explain",
+                };
+                shot.failed = Some(format!("the compositor would not copy the monitor: {why}"));
+            }
             _ => {}
         }
     }
@@ -643,34 +772,84 @@ mod tests {
 
     #[test]
     fn the_pixel_is_the_one_the_point_is_on_at_scale_2() {
-        // One unit at scale 2: a 2 × 2 copy. Its top left and bottom right
-        // are different pixels, and different colours where an edge runs
-        // through the unit.
-        let unit = marked(2, 2);
-        let (sx, sy) = pick((2, 2), (1.0, 1.0), (0.1, 0.1));
-        assert_eq!(at(&unit, 2, sx, sy), (0, 0));
-        let (sx, sy) = pick((2, 2), (1.0, 1.0), (0.75, 0.75));
-        assert_eq!(at(&unit, 2, sx, sy), (1, 1));
-        let (sx, sy) = pick((2, 2), (1.0, 1.0), (0.75, 0.25));
-        assert_eq!(at(&unit, 2, sx, sy), (1, 0));
+        // One unit at scale 2 is 2 × 2 pixels, and an edge can run through it.
+        let a = Axis::around(0.1, 100, 2.0, false);
+        assert_eq!((a.start, a.len, a.index(2)), (0, 1, 0));
+        assert_eq!(Axis::around(0.75, 100, 2.0, false).index(2), 1);
+        assert_eq!(Axis::around(40.75, 100, 2.0, false).index(2), 1);
     }
 
     #[test]
     fn the_pixel_is_the_one_the_point_is_on_at_scale_one_and_a_half() {
-        // A 2 × 2 region at 1.5 is 3 × 3: unit 0 is pixels 0 and half of 1,
-        // unit 1 the other half of 1 and 2.
-        let region = marked(3, 3);
-        let seen = |x: f64, y: f64| {
-            let (sx, sy) = pick((3, 3), (2.0, 2.0), (x, y));
-            at(&region, 3, sx, sy)
-        };
-        assert_eq!(seen(0.2, 0.2), (0, 0));
-        assert_eq!(seen(0.8, 0.2), (1, 0));
-        assert_eq!(seen(1.0, 1.0), (1, 1));
-        assert_eq!(seen(1.9, 1.4), (2, 2));
-        // The edges stay inside the copy.
-        assert_eq!(seen(2.0, 2.0), (2, 2));
-        assert_eq!(seen(-0.1, 0.0), (0, 0));
+        // At 1.5, unit 0 is pixel 0 and half of pixel 1: 0.6 is on pixel 0
+        // (0.9), 0.7 on pixel 1 (1.05). The span is two units, 3 pixels.
+        let a = Axis::around(0.6, 100, 1.5, false);
+        assert_eq!((a.start, a.len, a.index(3)), (0, 2, 0));
+        assert_eq!(Axis::around(0.7, 100, 1.5, false).index(3), 1);
+        // Unit 3 is in the span from 2 (pixel 3) to 4: 3.2 is pixel 4.
+        let a = Axis::around(3.2, 100, 1.5, false);
+        assert_eq!((a.start, a.len, a.index(3)), (2, 2, 1));
+    }
+
+    /// What a compositor sends for a region: the pixels it covers, in its own
+    /// layout, with its ends rounded or cut to whole pixels.
+    fn region(start: i32, len: i32, whole: i32, scale: f64, reversed: bool, round: bool) -> Vec<i64> {
+        let to_px = |v: f64| if round { v.round() as i64 } else { v as i64 };
+        let from = if reversed { whole - start - len } else { start } as f64;
+        let first = to_px(from * scale);
+        let n = if round { to_px((from + len as f64) * scale) - first } else { to_px(len as f64 * scale) };
+        let pixels: Vec<i64> = (first..first + n).collect();
+        // Made upright: a reversed axis comes back the other way round.
+        if reversed { pixels.into_iter().rev().collect() } else { pixels }
+    }
+
+    #[test]
+    fn the_pixel_is_right_however_the_compositor_rounds() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 121.0 / 120.0] {
+            for reversed in [false, true] {
+                for round in [false, true] {
+                    for k in 0..400 {
+                        let at = k as f64 * 0.2937 + 0.013;
+                        // 120 units: a whole number of pixels at every scale here.
+                        let a = Axis::around(at, 120, scale, reversed);
+                        let got = region(a.start, a.len, 120, scale, reversed, round);
+                        let seen = got[a.index(got.len() as u32) as usize];
+                        // The pixel the point is on, in the compositor's layout.
+                        let c = if reversed { 120.0 - at } else { at };
+                        let want = if reversed { (c * scale).ceil() as i64 - 1 } else { (c * scale).floor() as i64 };
+                        assert_eq!(seen, want, "scale {scale}, reversed {reversed}, rounded {round}, at {at}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_monitor_is_read_at_its_scale() {
+        // 10 units at 1.5 are 15 pixels: 0.6 is pixel 0, 9.9 pixel 14; turned
+        // the other way round, the same pixels counted from the far end.
+        assert_eq!(Axis::whole(0.6, 10, 1.5, false).index(15), 0);
+        assert_eq!(Axis::whole(9.9, 10, 1.5, false).index(15), 14);
+        assert_eq!(Axis::whole(0.6, 10, 1.5, true).index(15), 0);
+        assert_eq!(Axis::whole(0.7, 10, 1.5, true).index(15), 1);
+    }
+
+    #[test]
+    fn a_turned_monitor_runs_its_axes_backwards_where_it_should() {
+        assert_eq!(reversed(0), (false, false));
+        assert_eq!(reversed(2), (true, true));
+        assert_eq!(reversed(4), (true, false));
+        // A quarter turn: one axis runs backwards, the other does not.
+        assert_eq!(reversed(1), (true, false));
+        assert_eq!(reversed(3), (false, true));
+    }
+
+    #[test]
+    fn a_fractional_scale_is_snapped_to_its_step() {
+        // 2560 pixels over 1707 units is 1.4997…: 1.5.
+        assert_eq!(snap(2560.0 / 1707.0), 1.5);
+        assert_eq!(snap(1.0), 1.0);
+        assert_eq!(snap(2880.0 / 2304.0), 1.25);
     }
 
     #[test]

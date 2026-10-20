@@ -1083,6 +1083,14 @@ mod tests {
     }
 
     #[test]
+    fn a_frozen_monitor_is_looked_up_without_its_version() {
+        // What capture.freeze answers; the base is what capture::frame finds.
+        assert_eq!(live_name("capture:HEADLESS-1?12"), ("capture:HEADLESS-1", "12"));
+        assert_eq!(live_name("capture:DP-1"), ("capture:DP-1", ""));
+        assert_eq!(live_name("capture:DP-1?"), ("capture:DP-1?", ""));
+    }
+
+    #[test]
     fn a_live_frame_made_smaller_is_the_mean_of_each_box() {
         // Boxes of uneven sizes (36 into 7, 26 into 5), every pixel different:
         // each output pixel is the rounded mean of exactly the pixels of its box.
