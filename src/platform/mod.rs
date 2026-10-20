@@ -42,7 +42,7 @@ pub enum SysValue {
 ///  · `audio.level` → `{ level = 0.31 }`: how loud what plays is, up to 30 times a second (see `pulse`)
 ///  · `battery`    → `{ present, percent, charging }`
 ///  · `network`    → `{ online, kind = "wired" | "wifi" | "none", name, strength, wifi, networks }` (see `networkmanager`)
-///  · `bluetooth`  → `{ present, powered, discovering, devices, pairing, … }` (see `bluez`)
+///  · `bluetooth`  → `{ present, powered, discovering, devices, pairing, pairing_id, … }` (see `bluez`)
 ///  · `media`      → `{ playing, title, artist, album, length, position, rate, can_seek, art, player, players }`, or `{ player = "" }` if nothing is playing
 ///  · `clock`      → `{ hour, minute, second, day, month, year, weekday, time, date }`, when the minute changes
 ///  · `clock.seconds` → the same, every second
@@ -149,6 +149,15 @@ fn start_service(from: &str, name: &str, notify: Box<dyn Fn(SysValue) + Send>) -
     }
     let _ = (name, notify);
     false
+}
+
+/// Whether `from`'s scene shows what Bluetooth pairing asks, and answers it:
+/// only then does a pairing ask anyone (see `bluez`).
+pub fn bluetooth_pairing(from: &str, handles: bool) {
+    #[cfg(target_os = "linux")]
+    bluez::handles(from, handles);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (from, handles);
 }
 
 /// Ask a service to do something: `workspaces.focus`, 3.

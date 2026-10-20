@@ -522,6 +522,22 @@ impl LuauScript {
             return;
         }
         let who = self.owner();
+        // A pairing asks only a scene that says it shows what is asked —it
+        // declares `pairing`— and may answer it. Watching Bluetooth is not
+        // saying that: a bar's icon would turn a pairing that just works into a
+        // question nobody sees. Read again with each scene, so one that stops
+        // declaring it stops being asked.
+        let pairing = {
+            let c = self.c.lock().unwrap();
+            let declared = c.services.iter().any(|s| s.name == "bluetooth" && s.fields.iter().any(|f| f.name == "pairing"));
+            let has = |what: &str| c.permissions.services.iter().any(|x| x == what);
+            let may = has("bluetooth.*") || ["bluetooth.answer", "bluetooth.confirm", "bluetooth.cancel"].iter().all(|w| has(w));
+            if declared && !may {
+                eprintln!("logic  · `pairing` is shown but cannot be answered: add `services: \"bluetooth.*\"` to this scene's `permissions`");
+            }
+            declared && may
+        };
+        crate::platform::bluetooth_pairing(&who, pairing);
         let pending: Vec<crate::scene::Service> = {
             let c = self.c.lock().unwrap();
             c.services.iter().filter(|s| !c.subscribed.contains(&s.alias)).cloned().collect()

@@ -4,7 +4,7 @@ language 0.1
 // logic. Here are all there are, with everything they bring.
 scene Services {
     surface { size: 300, 160 }
-    permissions { services: "clock", "audio", "battery", "network", "bluetooth", "media", "window", "thumbnails" }
+    permissions { services: "clock", "audio", "battery", "network", "bluetooth.*", "media", "window", "thumbnails" }
 
     //  With `as`, its fields go after the name you choose: `now.time`.
     service clock as now {
@@ -37,6 +37,7 @@ scene Services {
         powered: bool
         discovering: bool
         pairing: none | pin | passkey | confirm | display | authorize
+        pairing_id: number
         pairing_address: text
         pairing_name: text
         pairing_code: text
