@@ -417,13 +417,13 @@ words: `sys.call("say", "bar", "emit card_landed 3")`, with `services:
 "say:bar"`, or `"say:*"` for any scene. What the other one answers is not
 brought back. A scene that is not running is an error for the caller, which
 names the ones that are, and so is an order it does not understand. One call
-is one command. The scene reached is the one `--say` reaches: the one shown on
+is one command, on one line, under 4096 bytes. The scene reached is the one `--say` reaches: the one shown on
 the caller's display, or, with none there, one shown on another, which the
-caller's log then says. Nothing is waited for beyond a second in all: a scene
-that has not taken the order by then is an error, and is not told it later
-(unless the error says it may have the order, the second having run out
-while it was being written), and a
-`wait` still waiting then, or a `watch`, is not an error: it says nothing about
+caller's log then says. Finding it, telling it and hearing back take about a
+second at most: a scene that has not taken the order by then is an error, and
+is not told it later (unless the error says it may have the order, the second
+having run out while it was being written), and a `wait` still waiting then,
+or a `watch`, is not an error: it says nothing about
 whether what was waited for came. `"say:*"` is shown with a ⚠ at startup: it
 can tell any scene anything, `quit` too. Two scenes that each answer the
 other's `emit` with one of their own tell each other forever, as they would
