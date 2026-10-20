@@ -1240,14 +1240,18 @@ impl LuauScript {
         })?)?;
         let (c, mine) = (self.c.clone(), who.clone());
         sys.set("call", lua.create_function(move |_, (name, args): (String, mlua::Variadic<Value>)| {
-            let args: Vec<SysValue> = args.iter().map(|v| lua_to_value(v, 0)).collect();
+            // Permission first, before anything the logic passed is converted.
             if name != "say" {
                 check_service_permission(&c, &name, true)?;
+                let args: Vec<SysValue> = args.iter().map(|v| lua_to_value(v, 0)).collect();
                 return crate::platform::command(&mine, &name, &args).map_err(mlua::Error::runtime);
             }
-            if let Some(SysValue::Text(scene)) = args.first() {
-                check_say_permission(&c, scene)?;
+            match args.first() {
+                Some(Value::String(scene)) => check_say_permission(&c, &scene.to_string_lossy())?,
+                // Not a scene's name: `say`'s own error says how it is called.
+                _ => return crate::platform::command(&mine, &name, &[]).map_err(mlua::Error::runtime),
             }
+            let args: Vec<SysValue> = args.iter().map(|v| lua_to_value(v, 0)).collect();
             // Waiting for the other scene does not count against the handler's
             // patience, as with `sys.ask`.
             let t0 = Instant::now();

@@ -720,30 +720,62 @@ pub fn say(_: &str, _: &str) -> Result<(), String> {
 #[cfg(unix)]
 fn say_at(path: &std::path::Path, scene: &str, command: &str) -> Result<(), String> {
     use std::io::Write;
-    // No socket, or one left behind by a scene that ended: nobody to tell.
-    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|_| format!("the scene '{scene}' is not running"))?;
-    writeln!(s, "{command}").map_err(|e| format!("'{scene}': {e}"))?;
-    let _ = s.shutdown(std::net::Shutdown::Write);
-    // An order answers nothing and the connection closes at once; a `? …` comes
-    // as fast. Whatever takes longer (`wait`, `watch`) is not waited for: the
-    // logic does not stand still for another scene. One second in all, not
-    // per read: a `watch` that keeps talking would hold it for as long as it talks.
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    let mut answer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let left = until.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
-            break;
+    use std::time::{Duration, Instant};
+    // One second in all, for the whole exchange. Connecting to a scene that has
+    // stopped taking calls (its queue full) or writing to one that stopped
+    // reading blocks, and a native call cannot be cut off by the logic's
+    // patience: so the exchange goes on a thread of its own, and the logic
+    // waits for it no longer than that. A thread left blocked ends when that
+    // scene takes the call or goes away.
+    let until = Instant::now() + Duration::from_secs(1);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<bool, String>>();
+    let (path, who, command) = (path.to_owned(), scene.to_owned(), command.to_owned());
+    std::thread::spawn(move || {
+        // No socket, or one left behind by a scene that ended: nobody to tell.
+        let Ok(mut s) = std::os::unix::net::UnixStream::connect(&path) else {
+            let _ = tx.send(Err(format!("the scene '{who}' is not running")));
+            return;
+        };
+        let _ = s.set_write_timeout(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))));
+        if let Err(e) = writeln!(s, "{command}") {
+            let _ = tx.send(Err(format!("'{who}': {e}")));
+            return;
         }
-        match std::io::Read::read(&mut s, &mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => answer.extend_from_slice(&chunk[..n]),
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let _ = tx.send(Ok(false));
+        // An order answers nothing and the connection closes at once; a `? …`
+        // comes as fast. Whatever takes longer (`wait`, `watch`) is not waited
+        // for: the logic does not stand still for another scene. The deadline
+        // holds across reads: a `watch` that keeps talking would otherwise hold
+        // it for as long as it talks.
+        let mut answer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
+                break;
+            }
+            match std::io::Read::read(&mut s, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => answer.extend_from_slice(&chunk[..n]),
+            }
         }
+        let _ = tx.send(match String::from_utf8_lossy(&answer).lines().find_map(|l| l.strip_prefix("? ").map(str::to_owned)) {
+            Some(wrong) => Err(format!("'{who}' answers: {wrong}")),
+            None => Ok(true),
+        });
+    });
+    let left = || until.saturating_duration_since(Instant::now());
+    // Not even taken within the second: the order did not get there.
+    match rx.recv_timeout(left()) {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(format!("the scene '{scene}' did not take the order within a second")),
     }
-    match String::from_utf8_lossy(&answer).lines().find_map(|l| l.strip_prefix("? ").map(str::to_owned)) {
-        Some(wrong) => Err(format!("'{scene}' answers: {wrong}")),
-        None => Ok(()),
+    // Taken: only a `? …` is an error; one still waiting at the second is not.
+    match rx.recv_timeout(left() + Duration::from_millis(50)) {
+        Ok(Err(e)) => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -1202,6 +1234,32 @@ pub(crate) mod tests {
     thread_local! {
         /// Where this test thread's scenes listen, instead of the real ones'.
         pub(crate) static SOCKETS: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn a_scene_that_takes_no_calls_holds_the_caller_one_second_in_all() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("pleamar-say-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bar.sock");
+        // A scene stuck: it never accepts, and its queue is as short as it gets.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let filler = path.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok(s) = std::os::unix::net::UnixStream::connect(&filler) {
+                held.push(s);
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let t = std::time::Instant::now();
+        assert_eq!(say_at(&path, "bar", "emit x"), Err("the scene 'bar' did not take the order within a second".into()));
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(1500), "held for {took:?}");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
