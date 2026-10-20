@@ -323,6 +323,7 @@ What each service brings is in the vocabulary (§17), and **asking it for what i
 | | |
 | --- | --- |
 | `audio.volume` | 0 to 1 |
+| `audio.level` · `level` | how loud what plays is right now, 0 to 1: the loudest sample, up to 30 times a second. Not the volume: a silence is 0 whatever the slider says. Its own service, `service audio.level as vu { level: number }`, under the same `services: "audio"`; only with a sound server (PulseAudio or PipeWire) |
 | `battery.percent` | 0 to 100 |
 | `brightness.present` · `brightness.level` | the screen's backlight, 0 to 1. A machine with none says `present = false` |
 | `network.strength` | 0 to 100 |
@@ -1648,10 +1649,11 @@ fact_types: number bool
 model: list
 path: move line curve close
 documented: translations surface permissions model service spring prop pose fact event text image figure font particles shader blur measure let zone body ellipse box arc line path input clip group popup component children repeat for row grid windows window pages column space between layer on every blink wave spin follow look ripple gesture posture import scene library include part language
-services: clock clock.seconds audio battery brightness network bluetooth media window thumbnails workspaces apps tray notifications notification_history polkit
+services: clock clock.seconds audio audio.level battery brightness network bluetooth media window thumbnails workspaces apps tray notifications notification_history polkit
 services.clock: hour minute second day month year weekday time date
 services.clock.seconds: hour minute second day month year weekday time date
 services.audio: volume muted input input_muted outputs inputs apps
+services.audio.level: level
 services.battery: present percent charging
 services.brightness: present level
 services.network: online kind name strength wifi error networks
