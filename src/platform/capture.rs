@@ -278,19 +278,25 @@ impl Link {
             return Err(Asked::No(format!("{x}, {y} is outside the monitor '{}' ({} × {})", o.name, o.size.0, o.size.1)));
         }
         let (wl, size, scale, transform) = (o.wl.clone(), o.size, o.scale(), o.transform);
+        // The monitor's real length in pixels on each upright axis: the logical
+        // size is rounded, so size × scale can be half a pixel more or less.
+        let pixels = match o.mode {
+            Some((w, h)) if transform & 1 == 1 => (h as i64, w as i64),
+            Some((w, h)) => (w as i64, h as i64),
+            None => ((size.0 as f64 * scale).round() as i64, (size.1 as f64 * scale).round() as i64),
+        };
         if let Some(wlr) = self.state.wlr.clone() {
             // A region around the point, laid on the scale's pixel grid so that
             // however the compositor rounds it, it starts on a known pixel.
             let (rx, ry) = reversed(transform);
-            let (ax, ay) = (Axis::around(fx, size.0, scale, rx), Axis::around(fy, size.1, scale, ry));
+            let (ax, ay) = (Axis::around(fx, size.0, pixels.0, scale, rx), Axis::around(fy, size.1, pixels.1, scale, ry));
             let frame = wlr.capture_output_region(0, &wl, ax.start, ay.start, ax.len, ay.len, &self.qh, ());
             let (px, w, h, _) = self.copy_wlr(frame, &wl)?;
             return Ok(hex(&px[(ay.index(h) * w + ax.index(w)) as usize * 4..]));
         }
         // The whole monitor, upright, in its pixels, which may be more than its units.
-        let (px, w, h, applied) = self.copy_ext(&wl)?;
-        let (rx, ry) = reversed(applied);
-        let (ax, ay) = (Axis::whole(fx, size.0, scale, rx), Axis::whole(fy, size.1, scale, ry));
+        let (px, w, h, _) = self.copy_ext(&wl)?;
+        let (ax, ay) = (Axis::whole(fx, scale), Axis::whole(fy, scale));
         Ok(hex(&px[(ay.index(h) * w + ax.index(w)) as usize * 4..]))
     }
 
@@ -440,27 +446,22 @@ struct Axis {
 }
 
 impl Axis {
-    /// The point `at` along a monitor `whole` units long, and its pixel.
-    fn point(at: f64, whole: i32, scale: f64, reversed: bool) -> (f64, i64) {
-        let c = if reversed { whole as f64 - at } else { at };
-        // A pixel holds its start, not its end; seen from the far end, the other way.
-        let pixel = if reversed { (c * scale).ceil() as i64 - 1 } else { (c * scale).floor() as i64 };
-        (c, pixel)
-    }
-
-    /// The whole monitor.
-    fn whole(at: f64, whole: i32, scale: f64, reversed: bool) -> Axis {
-        let (_, pixel) = Axis::point(at, whole, scale, reversed);
-        Axis { start: 0, len: whole, offset: pixel, reversed }
+    /// The whole monitor, already upright: the point's pixel is where it
+    /// falls from the start, whatever the copy's real length.
+    fn whole(at: f64, scale: f64) -> Axis {
+        Axis { start: 0, len: 0, offset: (at * scale).floor() as i64, reversed: false }
     }
 
     /// A span around the point that starts and ends on whole pixels at this
     /// scale, so that a compositor rounding its ends to pixels (wlroots rounds,
     /// pleamar-wm truncates) cannot move them: at 1.5 an even unit, at 1.25 a
-    /// fourth one.
-    fn around(at: f64, whole: i32, scale: f64, reversed: bool) -> Axis {
-        let (c, pixel) = Axis::point(at, whole, scale, reversed);
-        let unit = if reversed { c.ceil() as i64 - 1 } else { c.floor() as i64 };
+    /// fourth one. On a reversed axis the span is laid out from the far end, as
+    /// the compositor lays it, and the point's pixel is counted from the
+    /// monitor's real end (`pixels`), not from `whole` × `scale`.
+    fn around(at: f64, whole: i32, pixels: i64, scale: f64, reversed: bool) -> Axis {
+        let upright = (at * scale).floor() as i64;
+        let pixel = if reversed { pixels - 1 - upright } else { upright };
+        let unit = (pixel as f64 / scale).floor() as i64;
         let step = 120 / gcd((scale * 120.0).round() as i64, 120).max(1);
         let from = (unit.div_euclid(step) * step).max(0);
         let to = ((unit + step).div_euclid(step) * step).min(whole as i64).max(from + 1);
@@ -773,27 +774,28 @@ mod tests {
     #[test]
     fn the_pixel_is_the_one_the_point_is_on_at_scale_2() {
         // One unit at scale 2 is 2 × 2 pixels, and an edge can run through it.
-        let a = Axis::around(0.1, 100, 2.0, false);
+        let a = Axis::around(0.1, 100, 200, 2.0, false);
         assert_eq!((a.start, a.len, a.index(2)), (0, 1, 0));
-        assert_eq!(Axis::around(0.75, 100, 2.0, false).index(2), 1);
-        assert_eq!(Axis::around(40.75, 100, 2.0, false).index(2), 1);
+        assert_eq!(Axis::around(0.75, 100, 200, 2.0, false).index(2), 1);
+        assert_eq!(Axis::around(40.75, 100, 200, 2.0, false).index(2), 1);
     }
 
     #[test]
     fn the_pixel_is_the_one_the_point_is_on_at_scale_one_and_a_half() {
         // At 1.5, unit 0 is pixel 0 and half of pixel 1: 0.6 is on pixel 0
         // (0.9), 0.7 on pixel 1 (1.05). The span is two units, 3 pixels.
-        let a = Axis::around(0.6, 100, 1.5, false);
+        let a = Axis::around(0.6, 100, 150, 1.5, false);
         assert_eq!((a.start, a.len, a.index(3)), (0, 2, 0));
-        assert_eq!(Axis::around(0.7, 100, 1.5, false).index(3), 1);
+        assert_eq!(Axis::around(0.7, 100, 150, 1.5, false).index(3), 1);
         // Unit 3 is in the span from 2 (pixel 3) to 4: 3.2 is pixel 4.
-        let a = Axis::around(3.2, 100, 1.5, false);
+        let a = Axis::around(3.2, 100, 150, 1.5, false);
         assert_eq!((a.start, a.len, a.index(3)), (2, 2, 1));
     }
 
     /// What a compositor sends for a region: the pixels it covers, in its own
     /// layout, with its ends rounded or cut to whole pixels.
     fn region(start: i32, len: i32, whole: i32, scale: f64, reversed: bool, round: bool) -> Vec<i64> {
+        // wlroots turns the box with the logical size, then scales it.
         let to_px = |v: f64| if round { v.round() as i64 } else { v as i64 };
         let from = if reversed { whole - start - len } else { start } as f64;
         let first = to_px(from * scale);
@@ -811,7 +813,7 @@ mod tests {
                     for k in 0..400 {
                         let at = k as f64 * 0.2937 + 0.013;
                         // 120 units: a whole number of pixels at every scale here.
-                        let a = Axis::around(at, 120, scale, reversed);
+                        let a = Axis::around(at, 120, (120.0 * scale) as i64, scale, reversed);
                         let got = region(a.start, a.len, 120, scale, reversed, round);
                         let seen = got[a.index(got.len() as u32) as usize];
                         // The pixel the point is on, in the compositor's layout.
@@ -825,13 +827,34 @@ mod tests {
     }
 
     #[test]
+    fn the_pixel_is_right_where_the_logical_size_was_rounded() {
+        // 2560 pixels at 1.5 are 1706.67 units, said as 1707: size × scale is
+        // 2560.5, half a pixel past the real end. Near both ends, either way
+        // round and however the compositor rounds, the point's pixel is the
+        // one counted from the real start, or the real end when reversed.
+        for reversed in [false, true] {
+            for round in [false, true] {
+                for at in [0.1, 0.6, 0.75, 1.4, 853.3, 1705.2, 1706.1, 1706.6] {
+                    let a = Axis::around(at, 1707, 2560, 1.5, reversed);
+                    let got = region(a.start, a.len, 1707, 1.5, reversed, round);
+                    let up = (at * 1.5_f64).floor() as i64;
+                    let want = if reversed { 2559 - up } else { up };
+                    assert_eq!(got[a.index(got.len() as u32) as usize], want, "reversed {reversed}, rounded {round}, at {at}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_whole_monitor_is_read_at_its_scale() {
-        // 10 units at 1.5 are 15 pixels: 0.6 is pixel 0, 9.9 pixel 14; turned
-        // the other way round, the same pixels counted from the far end.
-        assert_eq!(Axis::whole(0.6, 10, 1.5, false).index(15), 0);
-        assert_eq!(Axis::whole(9.9, 10, 1.5, false).index(15), 14);
-        assert_eq!(Axis::whole(0.6, 10, 1.5, true).index(15), 0);
-        assert_eq!(Axis::whole(0.7, 10, 1.5, true).index(15), 1);
+        // 10 units at 1.5 are 15 pixels: 0.6 is pixel 0, 0.7 pixel 1, 9.9 pixel 14.
+        assert_eq!(Axis::whole(0.6, 1.5).index(15), 0);
+        assert_eq!(Axis::whole(0.7, 1.5).index(15), 1);
+        assert_eq!(Axis::whole(9.9, 1.5).index(15), 14);
+        // The copy is upright, so a rounded logical size changes nothing: 1707
+        // units for 2560 pixels, and 0.75 is pixel 1 (1.125), not 0.
+        assert_eq!(Axis::whole(0.75, 1.5).index(2560), 1);
+        assert_eq!(Axis::whole(1706.6, 1.5).index(2560), 2559);
     }
 
     #[test]
