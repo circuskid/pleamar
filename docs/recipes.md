@@ -432,7 +432,7 @@ language 0.1
 scene Progress {
     surface { size: 240, 60 }
     permissions { services: "media" }
-    service media as song { playing: bool; position: number; rate: number; length: number }
+    service media as song { playing: bool; position: number; rate: number; length: number; can_seek: bool }
 
     fact heard: number = 0                      // `time` when the position last came in
     on change song.position { heard = time }
@@ -453,6 +453,15 @@ Paused, `elapsed` is just the position the pause reported. A scene that names
 `time` never rests, so this one paints every frame while it is open, paused or
 not. With reduced motion `time` stops, and the bar moves only when the player
 reports.
+
+To drag it, the logic sends the player there: `sys.call("media.seek", seconds)`
+once, when the pointer lets go, not on every move —each call is several
+round trips to the player—, and `sys.call("media.step", seconds)` for a few
+seconds either way from a key. Each is a permission of its own beside
+`"media"`: `services: "media", "media.seek", "media.step"`, or `"media.*"`.
+Where `can_seek` is false the player will not move (a live stream), so the bar
+is better left still. The new `position`
+comes back as a report, and `on change song.position` catches it like any other.
 
 ## Every window, with its picture
 

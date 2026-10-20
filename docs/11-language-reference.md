@@ -333,7 +333,7 @@ What each service brings is in the vocabulary (§17), and **asking it for what i
 | `network.kind` | `none`, `wired` or `wifi` |
 | `polkit.error` | `none`, or `wrong` after an answer that was not it |
 | `network.error` | why the last attempt to join a network did not get in: `none` (it did, or none was made), `password` (wrong, or none given), `timeout`, `unsupported`, `busy` or `failed`. With iwd; with NetworkManager it stays `none`, and a network that was not joined is one that never turns `active` |
-| the `bool` ones | `muted`, `charging`, `present`, `online`, `playing` |
+| the `bool` ones | `muted`, `charging`, `present`, `online`, `playing`, `can_seek` |
  Whatever does not come in a report stays as it was.
 
 **Lists, into a model, with no logic.** What a service reports as a list goes
@@ -375,7 +375,7 @@ without it only the volume of whatever was already there can be moved.
 `players`, above, is all of them, and `name` is what each calls itself, which
 tells two phones through KDE Connect apart where `player` cannot.
 `sys.call("media.choose", id)` pins one: it is reported, and `media.toggle`,
-`next` and `previous` go to it, while it is there; `sys.call("media.choose", "")`
+`next`, `previous`, `seek` and `step` go to it, while it is there; `sys.call("media.choose", "")`
 goes back to that default. The choice is the process's, not the scene's.
 `playerctld` is left out: it only mirrors another player.
 
@@ -1656,7 +1656,7 @@ services.battery: present percent charging
 services.brightness: present level
 services.network: online kind name strength wifi error networks
 services.bluetooth: present powered discovering devices
-services.media: playing title artist album length position rate art player players
+services.media: playing title artist album length position rate can_seek art player players
 services.window: title class monitor list
 services.thumbnails: list capturing
 services.workspaces: active list
