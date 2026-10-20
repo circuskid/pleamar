@@ -160,11 +160,6 @@ impl Output {
             _ => self.scale.max(1) as f64,
         }
     }
-
-    /// Everything the questions need has been said.
-    fn described(&self) -> bool {
-        !self.name.is_empty() && self.size.0 > 0 && self.size.1 > 0
-    }
 }
 
 /// The copy under way, as far as it has got.
@@ -239,18 +234,22 @@ impl Link {
 
     /// The monitors as they are now, so that one unplugged a moment ago is not
     /// asked for. A monitor announced during a turn is only asked about after
-    /// it (its name, where it is), so turns go on until none came or went and
-    /// each one has said what it is.
+    /// it (its name, where it is), so turns go on until one passes with none
+    /// coming or going and nothing newly asked. A monitor that has said all it
+    /// will and is still not described (no xdg-output, or a size of 0) costs no
+    /// further turns: the answers to what was asked arrive before the turn's end.
     fn settle(&mut self) -> Result<(), Asked> {
         for _ in 0..4 {
             let before = self.state.changes;
+            let mut asked = false;
             if let Some(xdg) = &self.state.xdg {
                 for o in self.state.outputs.iter_mut().filter(|o| o.xdg.is_none()) {
                     o.xdg = Some(xdg.get_xdg_output(&o.wl, &self.qh, o.global));
+                    asked = true;
                 }
             }
             self.sync()?;
-            if self.state.changes == before && self.state.outputs.iter().all(Output::described) {
+            if self.state.changes == before && !asked {
                 break;
             }
         }
