@@ -22,6 +22,8 @@ scene Services {
     service clock.seconds as tick { second: number }
     //  Without `as`, each field is prefixed with the service name: `audio.volume`.
     service audio { volume: number; muted: bool }
+    //  How loud what plays is, not the volume: a meter's bar.
+    service audio.level as vu { level: number }
     service battery as bat { present: bool; percent: number; charging: bool }
     service network as net {
         online: bool
@@ -43,6 +45,7 @@ scene Services {
         text "{net.name}" { size: 11; color: #f5f7f5; show: net.online and net.kind == wifi }
         row { gap: 6
             box { size: 40 * audio.volume, 4; color: #9ed6bd; show: not audio.muted }
+            box { size: 40 * vu.level, 4; color: #9ed6bd }
             box { size: 40 * bat.percent, 4; color: #e8c07a; show: bat.present and not bat.charging }
             box { size: 4, 4; color: #f5f7f5; show: net.strength > 50 }
         }

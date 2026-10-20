@@ -39,6 +39,7 @@ pub enum SysValue {
 ///  · `window`     → `{ title, class }`
 ///  · `apps`       → `{ { name, exec, icon, …, terminal, actions }, … }`, once (see `desktop`)
 ///  · `audio`      → `{ volume = 0.54, muted = false }`
+///  · `audio.level` → `{ level = 0.31 }`: how loud what plays is, up to 30 times a second (see `pulse`)
 ///  · `battery`    → `{ present, percent, charging }`
 ///  · `network`    → `{ online, kind = "wired" | "wifi" | "none", name, strength, wifi, networks }` (see `networkmanager`)
 ///  · `bluetooth`  → `{ present, powered, discovering, devices }` (see `bluez`)
@@ -116,6 +117,8 @@ fn start_service(from: &str, name: &str, notify: Box<dyn Fn(SysValue) + Send>) -
         // Spoken to directly; through `wpctl` only if there is no server to speak to.
         "audio" if pulse::available() => return pulse::service(notify),
         "audio" => return system::audio(notify),
+        // The signal, not the volume: only with a sound server, which measures it.
+        "audio.level" if pulse::available() => return pulse::level_service(notify),
         "battery" => return system::battery(notify),
         "brightness" => return system::brightness(notify),
         // NetworkManager, which can be asked things too; without it iwd, which
