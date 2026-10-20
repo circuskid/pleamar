@@ -3813,6 +3813,13 @@ thread_local! {
 }
 
 impl Sheet {
+    /// Its monitor's refresh in mHz, for pacing: 60 Hz where the compositor
+    /// does not tell it (a headless output says 0, and a period of 1 mHz put
+    /// the render to sleep for a thousand seconds after its first frame).
+    pub fn pace_mhz(&self) -> i32 {
+        if self.mhz > 0 { self.mhz } else { 60_000 }
+    }
+
     /// Its size in pixels.
     pub fn px(&self) -> (u32, u32) {
         self.px

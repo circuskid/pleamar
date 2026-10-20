@@ -4225,7 +4225,7 @@ pub fn run(
         if !op.no_vsync && !op.naive {
             let right_now = Instant::now();
             if g.uses_mailbox() {
-                let mhz = sheets.iter().find(|l| l.drives_pace).map_or(60_000, |l| l.mhz.max(1));
+                let mhz = sheets.iter().find(|l| l.drives_pace).map_or(60_000, |l| l.pace_mhz());
                 // With `rate:`, the scene decides the step and not the monitor: a bar
                 // that breathes does not need 165 frames per second, and painting them is what
                 // costs. Never faster than the screen, which would be no use.
@@ -4431,7 +4431,7 @@ pub fn run(
             let fifo = g.blocks_on_screen(l) && !op.no_vsync && !op.naive;
             if fifo && l.open && in_flight.iter().any(|f| f.0 == l.id) {
                 if !l.unseen {
-                    let period = Duration::from_secs_f64(1000.0 / l.mhz.max(1) as f64);
+                    let period = Duration::from_secs_f64(1000.0 / l.pace_mhz() as f64);
                     let limit = Instant::now() + (period * 3).max(Duration::from_millis(50));
                     while in_flight.iter().any(|f| f.0 == l.id) {
                         let left = limit.saturating_duration_since(Instant::now());
@@ -4804,7 +4804,7 @@ pub fn run(
             // The LEARNT period is no good here: a scene that is always
             // late teaches it that the screen gives 28 ms and then it is never
             // late. It is compared with the monitor's real refresh.
-            let mut real = sheets.iter().find(|l| l.drives_pace).map_or(16.7, |l| 1_000_000.0 / l.mhz.max(1) as f32);
+            let mut real = sheets.iter().find(|l| l.drives_pace).map_or(16.7, |l| 1_000_000.0 / l.pace_mhz() as f32);
             if rate_now > 0 {
                 real = real.max(1000.0 / rate_now as f32);
             }
