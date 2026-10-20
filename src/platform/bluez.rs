@@ -144,7 +144,7 @@ pub fn handles(who: &str, on: bool) {
     if none_left {
         // A code that is only shown waits for no answer: the pairing itself is called off.
         if let Some(a) = withdraw(|_| true, Answer::Over).filter(|a| a.reply.is_none()) {
-            call_off(&a.device);
+            call_off(a.device);
         }
     }
 }
@@ -346,7 +346,7 @@ fn put(attempt: u64, kind: Kind, device: OwnedObjectPath, code: String, reply: O
     if !asks()
         && let Some(a) = withdraw(|a| a.id == id, Answer::Over).filter(|a| a.reply.is_none())
     {
-        std::thread::spawn(move || call_off(&a.device));
+        call_off(a.device);
     }
     id
 }
@@ -389,11 +389,14 @@ fn withdraw(which: impl Fn(&Asked) -> bool, answer: Answer) -> Option<Asked> {
 }
 
 /// Calls the device's pairing off: for a code that is only shown, which waits
-/// for no answer of ours that could say no.
-fn call_off(device: &OwnedObjectPath) {
-    if let Ok(c) = commands() {
-        let _ = Proxy::new(&c, BLUEZ, device.as_str(), DEVICE).and_then(|d| d.call_method("CancelPairing", &()));
-    }
+/// for no answer of ours that could say no. On its own thread: a BlueZ that
+/// does not answer would hold the logic for as long as a call may wait.
+fn call_off(device: OwnedObjectPath) {
+    std::thread::spawn(move || {
+        if let Ok(c) = commands() {
+            let _ = Proxy::new(&c, BLUEZ, device.as_str(), DEVICE).and_then(|d| d.call_method("CancelPairing", &()));
+        }
+    });
 }
 
 /// What BlueZ is told of a request that did not end in a yes.
@@ -560,7 +563,7 @@ impl Pairing {
     fn begin(attempt: u64) -> Result<Pairing, String> {
         let mut now = PAIRING.lock().unwrap();
         if now.is_some() {
-            return Err("busy: another device is pairing".into());
+            return Err("busy: a device is pairing already".into());
         }
         *now = Some(attempt);
         Ok(Pairing(attempt))
@@ -661,7 +664,7 @@ fn reply(what: &str, args: &[SysValue]) -> Option<Result<(), String>> {
             match withdraw(|a| a.id == id, Answer::No) {
                 // What is only shown waits for nothing here: the pairing itself is called off.
                 Some(a) => {
-                    call_off(&a.device);
+                    call_off(a.device);
                     Ok(())
                 }
                 None => Err("that question is not being asked any more".into()),
@@ -755,7 +758,17 @@ mod tests {
         asked_by(1, kind, code)
     }
 
+    /// Nothing left asked by a test that failed: a code only shown would
+    /// otherwise be called off, on the real bus, when the next one's scene goes.
+    fn clean() {
+        let left = ASKED.lock().unwrap().take();
+        if let Some(r) = left.and_then(|a| a.reply) {
+            r.give(Answer::Over);
+        }
+    }
+
     fn asked_by(attempt: u64, kind: Kind, code: &str) -> std::thread::JoinHandle<Answer> {
+        clean();
         handles("Test", true);
         let code = code.to_owned();
         let waiting = std::thread::spawn(move || zbus::block_on(ask(attempt, kind, OwnedObjectPath::try_from(DEV).unwrap(), code)));
@@ -770,12 +783,14 @@ mod tests {
         let _one_at_a_time = ONE.lock().unwrap();
         // `ask` saw a scene; it went before the question was put, so `handles`
         // had nothing to withdraw.
+        clean();
         handles("Test", true);
         handles("Test", false);
         let reply = Arc::new(Reply::default());
         put(1, Kind::Confirm, OwnedObjectPath::try_from(DEV).unwrap(), "333333".into(), Some(reply.clone()));
         assert!(ASKED.lock().unwrap().is_none());
-        assert_eq!(zbus::block_on(Wait(reply)), Answer::Over);
+        // Read, not waited for: left waiting, it fails rather than hangs.
+        assert_eq!(reply.0.lock().unwrap().0, Some(Answer::Over));
     }
 
     #[test]
@@ -945,8 +960,7 @@ mod tests {
     #[test]
     fn only_a_scene_that_shows_it_is_asked_and_its_going_ends_the_question() {
         let _one_at_a_time = ONE.lock().unwrap();
-        // Nothing shown is left over, or its going would call a real pairing off.
-        assert!(ASKED.lock().unwrap().is_none());
+        clean();
         handles("Test", false);
         // Watching is not showing: nothing is asked, and BlueZ is told `Canceled`.
         let _rx = watch();
