@@ -21,7 +21,8 @@ use super::SysValue;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -58,9 +59,17 @@ pub fn available() -> bool {
     Connection::system().ok().and_then(|c| objects(&c)).is_some_and(|o| adapter(&o).is_some())
 }
 
+/// No adapter, or no BlueZ: and nothing asked either, or a scene would go on
+/// showing a question nobody can answer any more.
+fn absent() -> SysValue {
+    let mut v = vec![("present".into(), SysValue::Bool(false))];
+    v.extend(["pairing", "pairing_address", "pairing_name", "pairing_code"].map(|k| (k.into(), SysValue::Text(if k == "pairing" { "none" } else { "" }.into()))));
+    SysValue::Map(v)
+}
+
 fn now(c: &Connection) -> SysValue {
-    let Some(o) = objects(c) else { return SysValue::Map(vec![("present".into(), SysValue::Bool(false))]) };
-    let Some((adapter_path, a)) = adapter(&o) else { return SysValue::Map(vec![("present".into(), SysValue::Bool(false))]) };
+    let Some(o) = objects(c) else { return absent() };
+    let Some((adapter_path, a)) = adapter(&o) else { return absent() };
     let mut devices: Vec<(bool, bool, SysValue)> = o
         .iter()
         .filter(|(p, _)| p.as_str().starts_with(adapter_path.as_str()))
@@ -102,8 +111,24 @@ fn now(c: &Connection) -> SysValue {
     SysValue::Map(v)
 }
 
+/// From now on, a `connect` asks whoever sits there, and the receiver is told
+/// when what is asked changes (BlueZ signals nothing of it).
+fn watch() -> (Sender<()>, Receiver<()>) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    WATCHERS.lock().unwrap().push(tx.clone());
+    (tx, rx)
+}
+
+/// Whether anything watches the service: whether a pairing can ask.
+fn asks() -> bool {
+    !WATCHERS.lock().unwrap().is_empty()
+}
+
 pub fn service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
     let Ok(c) = Connection::system() else { return false };
+    // Watching before anything is read, and before this returns: reading takes
+    // a round trip to BlueZ, and a `connect` given meanwhile would not ask.
+    let (tx, rx) = watch();
     std::thread::Builder::new()
         .name("bluetooth".into())
         .spawn(move || {
@@ -117,11 +142,8 @@ pub fn service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
                 }
             };
             report(&c);
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            // What pairing asks changes nothing BlueZ signals: the agent says so here.
-            WATCHERS.lock().unwrap().push(tx.clone());
             if let Ok(rule) = MatchRule::builder().msg_type(zbus::message::Type::Signal).sender(BLUEZ).map(|b| b.build()) {
-                let (c, tx) = (c.clone(), tx.clone());
+                let c = c.clone();
                 std::thread::spawn(move || {
                     let Ok(messages) = MessageIterator::for_match_rule(rule, &c, Some(64)) else { return };
                     for _ in messages {
@@ -182,7 +204,11 @@ impl Kind {
 enum Answer {
     Code(String),
     Yes,
+    /// Whoever sits there said no (`bluetooth.cancel`).
     No,
+    /// Nobody said anything, and it is over: something else was asked, BlueZ
+    /// gave up, or the pairing ended.
+    Over,
 }
 
 /// An answer BlueZ's call waits on, given from another thread: the first one counts.
@@ -221,6 +247,11 @@ impl Future for Wait {
 struct Asked {
     kind: Kind,
     device: OwnedObjectPath,
+    /// The `connect` whose pairing asks: only it, or BlueZ through its agent, ends it.
+    attempt: u64,
+    /// Kept from when it was asked, should the device go before it is answered.
+    address: String,
+    name: String,
     code: String,
     /// Whoever waits for the answer; none for what is only shown.
     reply: Option<Arc<Reply>>,
@@ -244,10 +275,15 @@ fn name(d: &HashMap<String, OwnedValue>) -> String {
 
 /// The service's pairing fields, read from what is being asked now.
 fn pairing(o: &Objects) -> Vec<(String, SysValue)> {
-    let asked = ASKED.lock().unwrap();
-    let device = asked.as_ref().and_then(|a| o.get(&a.device)).and_then(|i| i.get(DEVICE));
-    let address = device.map(|d| word(d, "Address")).unwrap_or_default();
-    let name = device.map(name).filter(|n| !n.is_empty()).unwrap_or_else(|| address.clone());
+    let mut asked = ASKED.lock().unwrap();
+    // Its name is remembered while it is there to be read.
+    if let Some(a) = asked.as_mut()
+        && let Some(n) = o.get(&a.device).and_then(|i| i.get(DEVICE)).map(name).filter(|n| !n.is_empty())
+    {
+        a.name = n;
+    }
+    let address = asked.as_ref().map(|a| a.address.clone()).unwrap_or_default();
+    let name = asked.as_ref().map(|a| a.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| address.clone());
     vec![
         ("pairing".into(), SysValue::Text(asked.as_ref().map_or("none", |a| a.kind.word()).into())),
         ("pairing_address".into(), SysValue::Text(address)),
@@ -256,21 +292,28 @@ fn pairing(o: &Objects) -> Vec<(String, SysValue)> {
     ]
 }
 
+/// The address in a device's path (`…/dev_AA_BB_CC_DD_EE_FF`), which BlueZ
+/// makes from it.
+fn address_of(device: &OwnedObjectPath) -> String {
+    device.as_str().rsplit('/').next().and_then(|last| last.strip_prefix("dev_")).map(|a| a.replace('_', ":")).unwrap_or_default()
+}
+
 /// Puts something new to whoever sits there. What was asked before and not
-/// answered is said no to: BlueZ asks one thing at a time, so it is over.
-fn put(kind: Kind, device: OwnedObjectPath, code: String, reply: Option<Arc<Reply>>) {
-    let before = ASKED.lock().unwrap().replace(Asked { kind, device, code, reply });
+/// answered is over: one question is shown at a time.
+fn put(attempt: u64, kind: Kind, device: OwnedObjectPath, code: String, reply: Option<Arc<Reply>>) {
+    let address = address_of(&device);
+    let before = ASKED.lock().unwrap().replace(Asked { kind, device, attempt, address, name: String::new(), code, reply });
     if let Some(r) = before.and_then(|b| b.reply) {
-        r.give(Answer::No);
+        r.give(Answer::Over);
     }
     tell();
 }
 
 /// Asks, and waits for the answer however long it takes: BlueZ gives up on its
 /// own after a while, and says so with `Cancel`.
-async fn ask(kind: Kind, device: OwnedObjectPath, code: String) -> Answer {
+async fn ask(attempt: u64, kind: Kind, device: OwnedObjectPath, code: String) -> Answer {
     let reply = Arc::new(Reply::default());
-    put(kind, device, code, Some(reply.clone()));
+    put(attempt, kind, device, code, Some(reply.clone()));
     let answer = Wait(reply.clone()).await;
     {
         let mut asked = ASKED.lock().unwrap();
@@ -282,18 +325,18 @@ async fn ask(kind: Kind, device: OwnedObjectPath, code: String) -> Answer {
     answer
 }
 
-/// Nothing is asked any more (about that device, if it says which): whoever
-/// waited is said no to. What was asked, if anything.
-fn withdraw(device: Option<&OwnedObjectPath>) -> Option<Asked> {
+/// Nothing is asked any more (for that attempt, if it says which): whoever
+/// waited is given `answer`. What was asked, if anything.
+fn withdraw(attempt: Option<u64>, answer: Answer) -> Option<Asked> {
     let asked = {
         let mut a = ASKED.lock().unwrap();
-        if device.is_some_and(|d| a.as_ref().is_some_and(|a| a.device != *d)) {
+        if attempt.is_some_and(|n| a.as_ref().is_some_and(|a| a.attempt != n)) {
             return None;
         }
         a.take()?
     };
     if let Some(r) = &asked.reply {
-        r.give(Answer::No);
+        r.give(answer);
     }
     tell();
     Some(asked)
@@ -311,7 +354,8 @@ enum AgentError {
 
 fn refused(answer: Answer) -> AgentError {
     match answer {
-        Answer::No => AgentError::Canceled("it was cancelled".into()),
+        Answer::No => AgentError::Rejected("whoever sits there said no".into()),
+        Answer::Over => AgentError::Canceled("it was cancelled".into()),
         _ => AgentError::Rejected("that is not what was asked".into()),
     }
 }
@@ -322,6 +366,8 @@ fn refused(answer: Answer) -> AgentError {
 /// (`NoInputNoOutput`: what pairing a pair of headphones needs).
 struct Agent {
     asks: bool,
+    /// Which `connect` this agent pairs for.
+    attempt: u64,
 }
 
 #[zbus::interface(name = "org.bluez.Agent1")]
@@ -332,7 +378,7 @@ impl Agent {
         if !self.asks {
             return Ok("0000".into());
         }
-        match ask(Kind::Pin, device, String::new()).await {
+        match ask(self.attempt, Kind::Pin, device, String::new()).await {
             Answer::Code(pin) => Ok(pin),
             other => Err(refused(other)),
         }
@@ -340,7 +386,7 @@ impl Agent {
 
     fn display_pin_code(&self, device: OwnedObjectPath, pincode: String) {
         if self.asks {
-            put(Kind::Display, device, pincode, None);
+            put(self.attempt, Kind::Display, device, pincode, None);
         }
     }
 
@@ -348,7 +394,7 @@ impl Agent {
         if !self.asks {
             return Ok(0);
         }
-        match ask(Kind::Passkey, device, String::new()).await {
+        match ask(self.attempt, Kind::Passkey, device, String::new()).await {
             // Checked when it was given: six digits at most.
             Answer::Code(passkey) => passkey.parse().map_err(|_| refused(Answer::Yes)),
             other => Err(refused(other)),
@@ -358,7 +404,7 @@ impl Agent {
     /// Called again with each key typed on the device (`entered`); the code is the same.
     fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, _entered: u16) {
         if self.asks {
-            put(Kind::Display, device, format!("{passkey:06}"), None);
+            put(self.attempt, Kind::Display, device, format!("{passkey:06}"), None);
         }
     }
 
@@ -366,7 +412,7 @@ impl Agent {
         if !self.asks {
             return Ok(());
         }
-        match ask(Kind::Confirm, device, format!("{passkey:06}")).await {
+        match ask(self.attempt, Kind::Confirm, device, format!("{passkey:06}")).await {
             Answer::Yes => Ok(()),
             other => Err(refused(other)),
         }
@@ -376,7 +422,7 @@ impl Agent {
         if !self.asks {
             return Ok(());
         }
-        match ask(Kind::Authorize, device, String::new()).await {
+        match ask(self.attempt, Kind::Authorize, device, String::new()).await {
             Answer::Yes => Ok(()),
             other => Err(refused(other)),
         }
@@ -385,17 +431,22 @@ impl Agent {
     /// A service of the device being paired, which this process asked for: yes.
     fn authorize_service(&self, _device: OwnedObjectPath, _uuid: String) {}
 
-    /// BlueZ gave up on what it asked: the device went, or nobody answered in time.
+    /// BlueZ gave up on what it asked this agent: the device went, or nobody
+    /// answered a confirm or an authorize in time (src/agent.c, REQUEST_TIMEOUT:
+    /// 60 s). A PIN or passkey not answered in time gets no `Cancel`: `Pair`
+    /// fails, and `connect` withdraws it.
     fn cancel(&self) {
-        withdraw(None);
+        withdraw(Some(self.attempt), Answer::Over);
     }
 }
 
 const AGENT_PATH: &str = "/org/pleamar/bluetooth_agent";
 
 fn connect(address: String) -> Result<(), String> {
-    let asks = !WATCHERS.lock().unwrap().is_empty();
-    let c = zbus::blocking::connection::Builder::system().and_then(|b| b.serve_at(AGENT_PATH, Agent { asks })).and_then(|b| b.build()).map_err(|e| e.to_string())?;
+    static ATTEMPTS: AtomicU64 = AtomicU64::new(1);
+    let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    let asks = asks();
+    let c = zbus::blocking::connection::Builder::system().and_then(|b| b.serve_at(AGENT_PATH, Agent { asks, attempt })).and_then(|b| b.build()).map_err(|e| e.to_string())?;
     let o = objects(&c).ok_or("BlueZ does not answer")?;
     let path = device_path(&o, &address).ok_or("that device is not known: scan first")?;
     let device = Proxy::new(&c, BLUEZ, path.as_str(), DEVICE).map_err(|e| e.to_string())?;
@@ -405,8 +456,10 @@ fn connect(address: String) -> Result<(), String> {
         let _ = manager.call_method("RegisterAgent", &(agent.clone(), if asks { "KeyboardDisplay" } else { "NoInputNoOutput" }));
         let paired = device.call_method("Pair", &());
         let _ = manager.call_method("UnregisterAgent", &(agent,));
-        // Paired or not, what was shown for it is over.
-        withdraw(Some(&path));
+        // Paired or not, what was shown for it is over; only for it: a second
+        // `connect` to a device already pairing fails here and must not take
+        // the first one's question away.
+        withdraw(Some(attempt), Answer::Over);
         paired.map_err(|e| format!("could not pair: {e}"))?;
         // Trusted: it may connect again by itself.
         let _ = device.set_property("Trusted", true);
@@ -424,21 +477,24 @@ fn reply(what: &str, args: &[SysValue]) -> Option<Result<(), String>> {
     };
     Some(match (what, args) {
         ("bluetooth.answer", [code]) => {
-            let code = match code {
-                SysValue::Text(t) => t.trim().to_owned(),
-                SysValue::Num(n) if *n >= 0.0 && n.fract() == 0.0 => format!("{n}"),
+            let kind = ASKED.lock().unwrap().as_ref().map(|a| a.kind);
+            let code = match (kind, code) {
+                (_, SysValue::Text(t)) => t.trim().to_owned(),
+                // A number has no leading zeros, and a PIN's are part of it.
+                (Some(Kind::Pin), SysValue::Num(_)) => return Some(Err("a PIN is given as text: \"0000\", not 0000".into())),
+                (_, SysValue::Num(n)) if *n >= 0.0 && n.fract() == 0.0 => format!("{n}"),
                 _ => return Some(Err("bluetooth.answer takes the code, as text".into())),
             };
-            let kind = ASKED.lock().unwrap().as_ref().map(|a| a.kind);
             match kind {
-                Some(Kind::Pin) if code.is_empty() || code.len() > 16 => Err("a PIN is 1 to 16 characters".into()),
+                Some(Kind::Pin) if code.is_empty() || code.len() > 16 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) => Err("a PIN is 1 to 16 letters or digits".into()),
                 Some(Kind::Passkey) if code.is_empty() || code.len() > 6 || !code.bytes().all(|b| b.is_ascii_digit()) => Err("a passkey is up to six digits".into()),
                 _ => give(&[Kind::Pin, Kind::Passkey], Answer::Code(code)),
             }
         }
         ("bluetooth.confirm", []) => give(&[Kind::Confirm, Kind::Authorize], Answer::Yes),
         ("bluetooth.cancel", []) => {
-            let asked = withdraw(None).ok_or_else(|| "nothing is being asked".to_owned());
+            // A no from whoever sits there: BlueZ is told `Rejected`.
+            let asked = withdraw(None, Answer::No).ok_or_else(|| "nothing is being asked".to_owned());
             // What is only shown waits for nothing here: the pairing itself is called off.
             asked.and_then(|a| {
                 let c = commands()?;
@@ -520,8 +576,12 @@ mod tests {
 
     /// What BlueZ asks, on its own thread as the bus would, until it is put to the scene.
     fn asked(kind: Kind, code: &str) -> std::thread::JoinHandle<Answer> {
+        asked_by(1, kind, code)
+    }
+
+    fn asked_by(attempt: u64, kind: Kind, code: &str) -> std::thread::JoinHandle<Answer> {
         let code = code.to_owned();
-        let waiting = std::thread::spawn(move || zbus::block_on(ask(kind, OwnedObjectPath::try_from(DEV).unwrap(), code)));
+        let waiting = std::thread::spawn(move || zbus::block_on(ask(attempt, kind, OwnedObjectPath::try_from(DEV).unwrap(), code)));
         while ASKED.lock().unwrap().is_none() {
             std::thread::yield_now();
         }
@@ -560,16 +620,84 @@ mod tests {
         let _one_at_a_time = ONE.lock().unwrap();
         let waiting = asked(Kind::Pin, "");
         // BlueZ's `Cancel`: nobody answered in time.
-        assert!(withdraw(None).is_some());
-        assert_eq!(waiting.join().unwrap(), Answer::No);
+        assert!(withdraw(Some(1), Answer::Over).is_some());
+        assert_eq!(waiting.join().unwrap(), Answer::Over);
         let waiting = asked(Kind::Authorize, "");
-        put(Kind::Display, OwnedObjectPath::try_from(DEV).unwrap(), "123456".into(), None);
-        assert_eq!(waiting.join().unwrap(), Answer::No);
+        put(1, Kind::Display, OwnedObjectPath::try_from(DEV).unwrap(), "123456".into(), None);
+        assert_eq!(waiting.join().unwrap(), Answer::Over);
         assert_eq!(field(&known(), "pairing"), "display");
-        // The pairing of another device ends: this one is still shown.
-        assert!(withdraw(Some(&OwnedObjectPath::try_from("/org/bluez/hci0/dev_00").unwrap())).is_none());
-        assert!(withdraw(Some(&OwnedObjectPath::try_from(DEV).unwrap())).is_some());
+        // Another pairing ends: this one is still shown.
+        assert!(withdraw(Some(2), Answer::Over).is_none());
+        assert!(withdraw(Some(1), Answer::Over).is_some());
         assert_eq!(field(&known(), "pairing"), "none");
+    }
+
+    #[test]
+    fn a_second_connect_to_the_same_device_leaves_the_first_ones_question() {
+        let _one_at_a_time = ONE.lock().unwrap();
+        let waiting = asked_by(7, Kind::Confirm, "123456");
+        // The second `Pair` fails (InProgress), and that attempt withdraws what is its own: nothing.
+        assert!(withdraw(Some(8), Answer::Over).is_none());
+        assert_eq!(field(&known(), "pairing"), "confirm");
+        assert!(withdraw(Some(7), Answer::Over).is_some());
+        assert_eq!(waiting.join().unwrap(), Answer::Over);
+    }
+
+    #[test]
+    fn a_no_is_rejected_and_an_end_is_cancelled() {
+        let _one_at_a_time = ONE.lock().unwrap();
+        // `bluetooth.cancel` withdraws with `No` (not called here: it would reach BlueZ).
+        let waiting = asked(Kind::Confirm, "123456");
+        assert!(withdraw(None, Answer::No).is_some());
+        let no = waiting.join().unwrap();
+        assert_eq!(no, Answer::No);
+        assert!(matches!(refused(no), AgentError::Rejected(_)));
+        assert!(matches!(refused(Answer::Over), AgentError::Canceled(_)));
+    }
+
+    #[test]
+    fn a_pin_is_text_and_keeps_its_zeros() {
+        let _one_at_a_time = ONE.lock().unwrap();
+        let waiting = asked(Kind::Pin, "");
+        for wrong in ["", "12 34", "12-34", "pïn", "12345678901234567"] {
+            assert!(command("bluetooth.answer", &[SysValue::Text(wrong.into())]).is_err(), "{wrong}");
+        }
+        assert!(command("bluetooth.answer", &[SysValue::Num(12.0)]).unwrap_err().contains("text"));
+        command("bluetooth.answer", &[SysValue::Text("0012ab".into())]).unwrap();
+        assert_eq!(waiting.join().unwrap(), Answer::Code("0012ab".into()));
+        // A passkey may still be a number.
+        let waiting = asked(Kind::Passkey, "");
+        command("bluetooth.answer", &[SysValue::Num(4321.0)]).unwrap();
+        assert_eq!(waiting.join().unwrap(), Answer::Code("4321".into()));
+    }
+
+    #[test]
+    fn the_device_is_still_named_when_it_goes_before_the_answer() {
+        let _one_at_a_time = ONE.lock().unwrap();
+        let waiting = asked(Kind::Confirm, "123456");
+        assert_eq!(field(&known(), "pairing_name"), "Keys");
+        let gone = Objects::new();
+        assert_eq!((field(&gone, "pairing_address").as_str(), field(&gone, "pairing_name").as_str()), ("AA:BB:CC:DD:EE:FF", "Keys"));
+        withdraw(None, Answer::Over);
+        waiting.join().unwrap();
+    }
+
+    #[test]
+    fn with_no_adapter_nothing_is_asked() {
+        let SysValue::Map(v) = absent() else { panic!() };
+        let get = |k: &str| v.iter().find(|(n, _)| n == k).map(|(_, v)| format!("{v:?}"));
+        assert_eq!(get("present"), Some(format!("{:?}", SysValue::Bool(false))));
+        assert_eq!(get("pairing"), Some(format!("{:?}", SysValue::Text("none".into()))));
+        for k in ["pairing_address", "pairing_name", "pairing_code"] {
+            assert_eq!(get(k), Some(format!("{:?}", SysValue::Text(String::new()))), "{k}");
+        }
+    }
+
+    #[test]
+    fn a_watcher_counts_from_when_it_watches() {
+        // `service` calls this before its thread reads anything, and before it returns.
+        let _rx = watch();
+        assert!(asks());
     }
 
     /// These share the one thing a process is asked at a time: one at a time.
