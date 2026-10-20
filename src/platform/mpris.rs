@@ -141,22 +141,32 @@ fn track_id(v: &OwnedValue) -> Option<OwnedObjectPath> {
     (path.as_str() != "/org/mpris/MediaPlayer2/TrackList/NoTrack").then_some(path)
 }
 
-/// How a player is moved to `to` seconds: inside the song (0 to `length`, when it says how long
-/// it is), in microseconds; to that place in this track if it has an id, otherwise by the
-/// difference from where it is now (`Seek`). A `Seek` past the end goes to the next song, and
-/// `SetPosition` past it is ignored: neither is what a scrubber at its end means.
+/// How a player is moved to `to` seconds: not before 0, and not past `length` where the player
+/// says how long the song is (with no length there is no end to hold it at), in microseconds; to
+/// that place in this track if it has an id, otherwise by the difference from where it is now
+/// (`Seek`). A `Seek` past the end goes to the next song, and `SetPosition` past it is ignored:
+/// neither is what a scrubber at its end means.
 #[derive(Debug, PartialEq)]
 enum Jump {
     To(OwnedObjectPath, i64),
     By(i64),
 }
 
+/// How far short of the end a `Seek` stops: `now` was read a moment before the call, and a song
+/// that plays on meanwhile would be carried past its end by the full difference.
+const SEEK_END_MARGIN: f64 = 0.5;
+
 fn jump(to: f64, now: f64, length: f64, track: Option<OwnedObjectPath>) -> Jump {
     let to = if length > 0.0 { to.clamp(0.0, length) } else { to.max(0.0) };
     let us = |s: f64| (s * 1e6).round() as i64;
     match track {
+        // A trackid gone stale (the song changed meanwhile) makes the spec's player ignore the
+        // call, and the wake after it reports the new song.
         Some(t) => Jump::To(t, us(to)),
-        None => Jump::By(us(to) - us(now)),
+        None => {
+            let to = if length > 0.0 { to.min((length - SEEK_END_MARGIN).max(0.0)) } else { to };
+            Jump::By(us(to) - us(now))
+        }
     }
 }
 
@@ -222,7 +232,8 @@ pub fn service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
 
 /// `media.toggle`, `media.next`, `media.previous`: to the one `now` is reporting.
 /// `media.seek(seconds)`: to that point of its song; `media.step(seconds)`: that far from where
-/// it is, back if negative. Both stay inside the song.
+/// it is, back if negative. Both stay inside the song where the player says how long it is (a
+/// `Seek` a little short of its end); with no length, only above 0.
 /// `media.choose(id)`: report that one, and command it, while it is there; `""` goes back to
 /// the one playing, else the one that played last, else the first.
 pub fn command(what: &str, args: &[SysValue]) -> Result<(), String> {
@@ -254,11 +265,20 @@ fn seek(relative: bool, s: f64) -> Result<(), String> {
     if !can_seek(&p) {
         return Err(format!("{} cannot seek (its CanSeek is false)", name.trim_start_matches(PREFIX)));
     }
-    let metadata: HashMap<String, OwnedValue> = p.get_property("Metadata").unwrap_or_default();
+    let who = name.trim_start_matches(PREFIX);
+    // Unlike `now`, which can report 0 for what it cannot read, a seek from a wrong place or for an
+    // unknown song goes to the wrong point: an error that could not be read is not "no trackid".
+    let metadata: HashMap<String, OwnedValue> = p.get_property("Metadata").map_err(|e| format!("{who} does not say what it is playing: {e}"))?;
     let length = metadata.get("mpris:length").map(seconds).unwrap_or(0.0);
-    let now = position(&p);
+    let track = metadata.get("mpris:trackid").and_then(track_id);
+    // Where it is matters to a step, and to a `Seek`, which goes by the difference.
+    let now = if relative || track.is_none() {
+        p.get_property::<OwnedValue>("Position").map(|v| seconds(&v)).map_err(|e| format!("{who} does not say where it is: {e}"))?
+    } else {
+        0.0
+    };
     let to = if relative { now + s } else { s };
-    let sent = match jump(to, now, length, metadata.get("mpris:trackid").and_then(track_id)) {
+    let sent = match jump(to, now, length, track) {
         Jump::To(track, us) => p.call_method("SetPosition", &(track, us)),
         Jump::By(us) => p.call_method("Seek", &(us,)),
     };
@@ -363,6 +383,14 @@ mod tests {
         assert_eq!(jump(5.0, 10.0, 300.0, None), Jump::By(-5_000_000));
         assert_eq!(jump(90.0, 10.0, 0.0, None), Jump::By(80_000_000));
         assert_eq!(jump(-1.0, 10.0, 0.0, None), Jump::By(-10_000_000));
+    }
+
+    #[test]
+    fn a_seek_by_the_difference_stops_short_of_the_end() {
+        // The song plays on between reading `now` and the `Seek`: the full difference could carry it over.
+        assert_eq!(jump(400.0, 10.0, 300.0, None), Jump::By(289_500_000));
+        assert_eq!(jump(300.0, 10.0, 300.0, None), Jump::By(289_500_000));
+        assert_eq!(jump(5.0, 0.0, 0.3, None), Jump::By(0));
     }
 
     #[test]
