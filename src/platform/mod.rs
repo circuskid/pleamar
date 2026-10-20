@@ -785,7 +785,8 @@ fn say_at(path: &std::path::Path, scene: &str, command: &str) -> Result<(), Stri
     let delivered = match rx.recv_timeout(left()) {
         Err(_) => {
             let mut p = phase.lock().unwrap();
-            if *p == WAITING {
+            // Given up by the worker itself (connected too late) is as sure a miss.
+            if *p != WRITING {
                 *p = GIVEN_UP;
                 return Err(format!("the scene '{scene}' did not take the order within a second"));
             }
