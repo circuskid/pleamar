@@ -32,7 +32,7 @@ scene Services {
     }
     service bluetooth as bt { present: bool; powered: bool; discovering: bool }
     service media as song { playing: bool; title: text; artist: text; album: text; length: number; position: number; rate: number; can_seek: bool; art: text; player: text }
-    service window as win { title: text; class: text }
+    service window as win { title: text; class: text; fullscreen: bool; maximized: bool }
     service thumbnails as thumbs { capturing: bool }
 
     column { at: 12, 12; gap: 6

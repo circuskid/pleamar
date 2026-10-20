@@ -36,6 +36,10 @@ struct Toplevel {
     monitor: String,
     /// Put away (minimized).
     minimized: bool,
+    /// Over the whole monitor, or filling the space it is given: what a bar
+    /// needs to stay out of the way, or to keep quiet while a film plays.
+    fullscreen: bool,
+    maximized: bool,
     /// When it last got the keyboard: while the focus moves, the one losing
     /// it and the one getting it may both say «active» for a moment.
     activated_at: u64,
@@ -94,6 +98,8 @@ impl State {
                     ("monitor".into(), SysValue::Text(t.monitor.clone())),
                     ("active".into(), SysValue::Bool(t.active)),
                     ("minimized".into(), SysValue::Bool(t.minimized)),
+                    ("fullscreen".into(), SysValue::Bool(t.fullscreen)),
+                    ("maximized".into(), SysValue::Bool(t.maximized)),
                 ])
             })
             .collect();
@@ -101,6 +107,8 @@ impl State {
             ("title".into(), SysValue::Text(active.title)),
             ("class".into(), SysValue::Text(active.class)),
             ("monitor".into(), SysValue::Text(active.monitor)),
+            ("fullscreen".into(), SysValue::Bool(active.fullscreen)),
+            ("maximized".into(), SysValue::Bool(active.maximized)),
             ("list".into(), SysValue::List(list)),
         ]);
         let fingerprint = format!("{v:?}");
@@ -136,6 +144,12 @@ impl State {
             dispatch(v);
         }
     }
+}
+
+/// Whether a toplevel's list of states has this one. The list comes as bytes,
+/// four to a state: `maximized` is 0, `minimized` 1, `activated` 2, `fullscreen` 3.
+fn has_state(states: &[u8], s: toplevel_handle::State) -> bool {
+    states.chunks_exact(4).any(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) == s as u32)
 }
 
 /// What is needed to ask the compositor for something from the logic thread.
@@ -206,8 +220,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
             toplevel_handle::Event::Title { title } => e.toplevels.entry(k).or_default().title = title,
             toplevel_handle::Event::AppId { app_id } => e.toplevels.entry(k).or_default().class = app_id,
             toplevel_handle::Event::State { state } => {
-                // The list of states comes as bytes; `activated` is 2, `minimized` 1.
-                let has = |s: toplevel_handle::State| state.chunks_exact(4).any(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) == s as u32);
+                let has = |s: toplevel_handle::State| has_state(&state, s);
                 e.next += 1;
                 let next = e.next as u64;
                 let t = e.toplevels.entry(k).or_default();
@@ -217,6 +230,8 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                 }
                 t.active = active;
                 t.minimized = has(toplevel_handle::State::Minimized);
+                t.fullscreen = has(toplevel_handle::State::Fullscreen);
+                t.maximized = has(toplevel_handle::State::Maximized);
             }
             toplevel_handle::Event::OutputEnter { output } => {
                 let name = e.output_name.get(&key(&output)).cloned().unwrap_or_default();
@@ -441,4 +456,41 @@ fn start() -> Option<Arc<Mutex<State>>> {
         })
         .ok()?;
     Some(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toplevel_handle::State as S;
+
+    fn bytes(states: &[S]) -> Vec<u8> {
+        states.iter().flat_map(|s| (*s as u32).to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn every_state_is_read_from_the_list() {
+        let list = bytes(&[S::Activated, S::Fullscreen]);
+        assert!(has_state(&list, S::Activated));
+        assert!(has_state(&list, S::Fullscreen));
+        assert!(!has_state(&list, S::Maximized));
+        assert!(!has_state(&list, S::Minimized));
+        let list = bytes(&[S::Maximized]);
+        assert!(has_state(&list, S::Maximized));
+        assert!(!has_state(&list, S::Fullscreen));
+        assert!(!has_state(&[], S::Fullscreen));
+    }
+
+    #[test]
+    fn the_report_says_fullscreen_and_maximized() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into = seen.clone();
+        let mut state = State { dispatch_window: Some(Box::new(move |v| into.lock().unwrap().push(format!("{v:?}")))), ..Default::default() };
+        state.toplevels.insert(1, Toplevel { title: "film".into(), active: true, fullscreen: true, ..Default::default() });
+        state.toplevels.insert(2, Toplevel { title: "editor".into(), maximized: true, ..Default::default() });
+        state.report_window();
+        let report = seen.lock().unwrap().pop().unwrap();
+        // The active one's, at the top, and each entry's in the list.
+        assert!(report.contains(r#"("fullscreen", Bool(true)), ("maximized", Bool(false)), ("list""#), "{report}");
+        assert!(report.contains(r#"("title", Text("editor")), ("class", Text("")), ("monitor", Text("")), ("active", Bool(false)), ("minimized", Bool(false)), ("fullscreen", Bool(false)), ("maximized", Bool(true))"#), "{report}");
+    }
 }

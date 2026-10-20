@@ -155,7 +155,28 @@ fn window() -> SysValue {
     let monitor = json("j/monitors")
         .and_then(|ms| ms.as_array()?.iter().find(|m| m["focused"].as_bool() == Some(true)).and_then(|m| m["name"].as_str().map(str::to_owned)))
         .unwrap_or_default();
-    SysValue::Map(vec![("title".into(), text("title")), ("class".into(), text("class")), ("monitor".into(), SysValue::Text(monitor))])
+    let (fullscreen, maximized) = fullscreen_mode(&v);
+    SysValue::Map(vec![
+        ("title".into(), text("title")),
+        ("class".into(), text("class")),
+        ("monitor".into(), SysValue::Text(monitor)),
+        ("fullscreen".into(), SysValue::Bool(fullscreen)),
+        ("maximized".into(), SysValue::Bool(maximized)),
+    ])
+}
+
+/// Whether a window is fullscreen, and whether maximized, from its `fullscreen`
+/// in `j/activewindow` (`fullscreenClient`, what the program asked for, is not
+/// read). From Hyprland 0.42 it is a number: 0 none, 1 maximized, 2 fullscreen.
+/// It is read as bits because in 0.42 the modes were flags, and 3 was both.
+/// Up to 0.41 it was a boolean, and `fullscreenMode` said which (0 fullscreen,
+/// 1 maximized). Anything else, or no window, is neither.
+fn fullscreen_mode(window: &serde_json::Value) -> (bool, bool) {
+    match (window["fullscreen"].as_i64(), window["fullscreen"].as_bool()) {
+        (Some(n), _) => (n & 2 != 0, n & 1 != 0),
+        (None, Some(true)) => if window["fullscreenMode"].as_i64() == Some(1) { (false, true) } else { (true, false) },
+        _ => (false, false),
+    }
 }
 
 /// Listens to what Hyprland tells and, when something of interest changes,
@@ -163,7 +184,7 @@ fn window() -> SysValue {
 pub fn service(name: &str, notify: Box<dyn Fn(SysValue) + Send>) -> bool {
     let (read, interesting): (fn() -> SysValue, &'static [&'static str]) = match name {
         "workspaces" => (workspaces, &["workspace", "createworkspace", "destroyworkspace", "openwindow", "closewindow", "movewindow", "focusedmon", "moveworkspace"]),
-        "window" => (window, &["activewindow", "closewindow", "windowtitle", "focusedmon"]),
+        "window" => (window, &["activewindow", "closewindow", "windowtitle", "focusedmon", "fullscreen"]),
         _ => return false,
     };
     let Some(path) = socket(".socket2.sock") else { return false };
@@ -216,5 +237,25 @@ pub fn command(name: &str, args: &[SysValue]) -> Result<(), String> {
         // In this house Hyprland's configuration is Lua, and so are its commands.
         ("workspaces.focus", [SysValue::Num(n)]) => request(&format!("dispatch hl.dsp.focus({{ workspace = {} }})", *n as i64)).map(|_| ()),
         _ => Err(format!("I don't know how to do '{name}' with that")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fullscreen_mode;
+    use serde_json::json;
+
+    #[test]
+    fn fullscreen_and_maximized_from_each_way_hyprland_says_it() {
+        let mode = |v| fullscreen_mode(&v);
+        assert_eq!(mode(json!({ "fullscreen": 0 })), (false, false));
+        assert_eq!(mode(json!({ "fullscreen": 1 })), (false, true));
+        assert_eq!(mode(json!({ "fullscreen": 2 })), (true, false));
+        assert_eq!(mode(json!({ "fullscreen": 3 })), (true, true));
+        assert_eq!(mode(json!({ "fullscreen": true, "fullscreenMode": 0 })), (true, false));
+        assert_eq!(mode(json!({ "fullscreen": true, "fullscreenMode": 1 })), (false, true));
+        assert_eq!(mode(json!({ "fullscreen": false, "fullscreenMode": 0 })), (false, false));
+        // No window with the focus: `j/activewindow` answers `{}`.
+        assert_eq!(mode(json!({})), (false, false));
     }
 }

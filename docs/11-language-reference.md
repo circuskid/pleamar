@@ -356,7 +356,7 @@ service tray { list: icons }
 | `bluetooth` | `devices`: `{ name, address, paired, connected, battery, icon }` |
 | `audio` | `outputs` · `inputs`: `{ id, name, default }`; `apps`: `{ id, name, icon, binary, title, volume, muted, playing }`, what is playing, one per stream |
 | `media` | `players`: `{ id, name, playing, chosen }`, by bus name |
-| `window` | `list`: `{ id, title, class, monitor, active, minimized }` (compositors with wlr-foreign-toplevel) |
+| `window` | `list`: `{ id, title, class, monitor, active, minimized, fullscreen, maximized }` (compositors with wlr-foreign-toplevel) |
 | `workspaces` | `list`: `{ id, name, windows, monitor, active }` |
 | `apps` | `list`: `{ name, exec, icon, id, wmclass, local_name, categories, generic_name, comment, keywords, terminal, actions }`; `actions`: `{ id, name, local_name, exec, icon }` |
 | `tray` | `list`: `{ key, id, title, status, icon, menu }` |
@@ -1657,7 +1657,7 @@ services.brightness: present level
 services.network: online kind name strength wifi error networks
 services.bluetooth: present powered discovering devices
 services.media: playing title artist album length position rate can_seek art player players
-services.window: title class monitor list
+services.window: title class monitor fullscreen maximized list
 services.thumbnails: list capturing
 services.workspaces: active list
 services.apps: list
