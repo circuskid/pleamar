@@ -71,9 +71,14 @@ pub fn describe(p: &Permissions) -> String {
     };
     // Bare: it runs whatever it is told. With its script (`"node usage.js"`), only that.
     let is_interpreter = |o: &str| !o.contains(' ') && INTERPRETERS.contains(&o.rsplit('/').next().unwrap_or(o));
-    let mut s = format!("commands: {} · services: {}", list(&p.commands, &is_interpreter), list(&p.services, &|_| false));
+    // `say:*` tells any scene any of `--say`'s commands, `quit` among them.
+    let says_to_all = |x: &str| x == "say:*";
+    let mut s = format!("commands: {} · services: {}", list(&p.commands, &is_interpreter), list(&p.services, &says_to_all));
     if p.commands.iter().any(|o| is_interpreter(o)) {
         s.push_str(" · ⚠ an interpreter runs whatever it is told: that is asking for everything");
+    }
+    if p.services.iter().any(|x| says_to_all(x)) {
+        s.push_str(" · ⚠ say:* tells any running scene anything --say can, quit included");
     }
     s
 }
@@ -120,4 +125,19 @@ pub fn ask(scene: &str, yes_to_all: bool) -> i32 {
         }
     }
     if denied > 0 { 2 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Permissions, describe};
+
+    #[test]
+    fn telling_every_scene_is_flagged_and_telling_one_is_not() {
+        let p = |services: &[&str]| Permissions { commands: Vec::new(), services: services.iter().map(|s| s.to_string()).collect() };
+        let one = describe(&p(&["say:bar"]));
+        assert!(!one.contains('⚠'), "{one}");
+        let all = describe(&p(&["audio", "say:*"]));
+        assert!(all.contains("say:* ⚠"), "{all}");
+        assert!(all.contains("⚠ say:* tells any running scene"), "{all}");
+    }
 }

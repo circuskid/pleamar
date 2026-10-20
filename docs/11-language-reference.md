@@ -417,8 +417,15 @@ words: `sys.call("say", "bar", "emit card_landed 3")`, with `services:
 "say:bar"`, or `"say:*"` for any scene. What the other one answers is not
 brought back. A scene that is not running is an error for the caller, which
 names the ones that are, and so is an order it does not understand. One call
-is one command. The two share no state: the one that owns a value keeps it as
-a fact, and tells the others with `emit` when it changes.
+is one command. The scene reached is the one `--say` reaches: the one shown on
+the caller's display, or, with none there, one shown on another, which the
+caller's log then says. Nothing is waited for beyond a second in all, so a
+`wait` still waiting then, or a `watch`, is not an error: it says nothing about
+whether what was waited for came. `"say:*"` is shown with a ⚠ at startup: it
+can tell any scene anything, `quit` too. Two scenes that each answer the
+other's `emit` with one of their own tell each other forever, as they would
+with `run("pleamar", "--say", …)`. The two share no state: the one that owns a
+value keeps it as a fact, and tells the others with `emit` when it changes.
 
 **One per monitor.** `screens: each [max N]` repeats the surface on every monitor (4 at most, unless said otherwise), and **each copy has its own**: its properties, its zones and its rules. Inside:
 

@@ -589,6 +589,10 @@ fn reach(scene: &str) -> Result<(std::path::PathBuf, Option<String>), String> {
 /// next to Hyprland) gives its programs another place, so that `marea
 /// search` there reaches its own Marea and not the other desktop's—.
 fn command_socket_path(scene: &str) -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = tests::SOCKETS.with(|d| d.borrow().clone()) {
+        return Some(dir.join(format!("{scene}.sock")));
+    }
     let dir = match std::env::var("PLEAMAR_SOCKETS").ok().filter(|d| !d.is_empty()) {
         Some(d) => std::path::PathBuf::from(d),
         None => std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())).join("pleamar"),
@@ -698,7 +702,11 @@ pub fn say(scene: &str, command: &str) -> Result<(), String> {
     if command.contains(['\n', '\r']) {
         return Err("`say` takes one command, on one line: call it again for the next".into());
     }
-    let (path, _) = reach(scene)?;
+    let (path, word) = reach(scene)?;
+    // The word `--say` gives too: the scene told is shown on another display.
+    if let Some(w) = word {
+        eprintln!("{w}");
+    }
     say_at(&path, scene, command).map_err(|e| match running_scenes() {
         others if e.ends_with("is not running") && !others.is_empty() => format!("{e} (running: {})", others.join(", ")),
         _ => e,
@@ -718,11 +726,22 @@ fn say_at(path: &std::path::Path, scene: &str, command: &str) -> Result<(), Stri
     let _ = s.shutdown(std::net::Shutdown::Write);
     // An order answers nothing and the connection closes at once; a `? …` comes
     // as fast. Whatever takes longer (`wait`, `watch`) is not waited for: the
-    // logic does not stand still for another scene.
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-    let mut answer = String::new();
-    let _ = std::io::Read::read_to_string(&mut s, &mut answer);
-    match answer.lines().find_map(|l| l.strip_prefix("? ")) {
+    // logic does not stand still for another scene. One second in all, not
+    // per read: a `watch` that keeps talking would hold it for as long as it talks.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut answer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match std::io::Read::read(&mut s, &mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => answer.extend_from_slice(&chunk[..n]),
+        }
+    }
+    match String::from_utf8_lossy(&answer).lines().find_map(|l| l.strip_prefix("? ").map(str::to_owned)) {
         Some(wrong) => Err(format!("'{scene}' answers: {wrong}")),
         None => Ok(()),
     }
@@ -1176,9 +1195,39 @@ pub fn icon(_: &str) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::{say, say_at};
     use std::io::{BufRead, BufReader, Write};
+
+    thread_local! {
+        /// Where this test thread's scenes listen, instead of the real ones'.
+        pub(crate) static SOCKETS: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn a_watch_that_keeps_talking_holds_the_caller_one_second_in_all() {
+        let dir = std::env::temp_dir().join(format!("pleamar-say-drip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bar.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // A `watch` that answers a line every 200 ms, for ten seconds.
+        std::thread::spawn(move || {
+            if let Some(mut c) = listener.incoming().map_while(Result::ok).next() {
+                for i in 0..50 {
+                    if writeln!(c, "bar.level {i}").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        });
+        let t = std::time::Instant::now();
+        assert_eq!(say_at(&path, "bar", "watch 10s bar.level"), Ok(()));
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(1500), "held for {took:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_scene_tells_another_and_hears_only_what_went_wrong() {

@@ -1728,13 +1728,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn say_from_the_logic_is_refused_or_errs_when_nobody_is_there() {
         use super::{LuauScript, Script};
         use crate::scene::{Event, ToRender};
         let dir = std::env::temp_dir().join(format!("pleamar-say-logic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // A name no scene has, so that nothing real is told anything.
-        let absent = format!("nobody-{}", std::process::id());
+        // The scenes this thread reaches listen here, not where the real ones do:
+        // one stand-in that answers, `osd`, and none called `bar`.
+        crate::platform::tests::SOCKETS.with(|d| *d.borrow_mut() = Some(dir.clone()));
+        let _osd = std::os::unix::net::UnixListener::bind(dir.join("osd.sock")).unwrap();
+        let absent = "bar";
         let (scene, logic) = (dir.join("teller.plm"), dir.join("teller.luau"));
         std::fs::write(&scene, format!("scene Teller {{\n    surface {{ size: 10, 10 }}\n    permissions {{ services: \"say:{absent}\" }}\n    text refused = \"\"\n    text absent = \"\"\n}}\n")).unwrap();
         std::fs::write(&logic, format!("local _, e = pcall(sys.call, \"say\", \"toasts\", \"emit x\")\ntext.refused = tostring(e)\nlocal _, f = pcall(sys.call, \"say\", \"{absent}\", \"emit x\")\ntext.absent = tostring(f)\n")).unwrap();
@@ -1747,7 +1752,8 @@ mod tests {
         let texts: std::collections::HashMap<&str, String> = rx.try_iter().filter_map(|m| if let ToRender::Text(k, v) = m { Some((k, v)) } else { None }).collect();
         assert!(texts["refused"].contains("no permission to talk to the scene 'toasts'"), "{}", texts["refused"]);
         assert!(texts["refused"].contains("services: \"say:toasts\""), "{}", texts["refused"]);
-        assert!(texts["absent"].contains(&format!("the scene '{absent}' is not running")), "{}", texts["absent"]);
+        assert!(texts["absent"].contains("the scene 'bar' is not running (running: osd)"), "{}", texts["absent"]);
+        crate::platform::tests::SOCKETS.with(|d| *d.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
