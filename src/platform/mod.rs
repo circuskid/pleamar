@@ -255,6 +255,11 @@ pub fn query(from: &str, name: &str, args: &[SysValue]) -> Result<SysValue, Stri
     if name.starts_with("tray.") {
         return tray::query(name, args);
     }
+    // What is on a monitor: a pixel's colour, or the whole of it kept.
+    #[cfg(target_os = "linux")]
+    if name.starts_with("capture.") {
+        return capture::query(name, args);
+    }
     let _ = args;
     Err(format!("this system cannot answer '{name}' yet"))
 }
@@ -1052,10 +1057,17 @@ mod tray;
 mod compositor;
 #[cfg(target_os = "linux")]
 mod thumbnails;
-/// A live window's last frame (`thumbnails.live`), by the `picture` that
-/// names it, for the image that draws it.
 #[cfg(target_os = "linux")]
-pub use thumbnails::{frame as thumbnail_frame, Frame as ThumbnailFrame};
+mod capture;
+#[cfg(target_os = "linux")]
+pub use thumbnails::Frame as ThumbnailFrame;
+/// A frame kept in memory, by the name that `image … = from` was given: a
+/// live window's last one (`thumbnails:3`, `thumbnails.live`) or a frozen
+/// monitor (`capture:DP-1`, `capture.freeze`).
+#[cfg(target_os = "linux")]
+pub fn thumbnail_frame(name: &str) -> Option<std::sync::Arc<ThumbnailFrame>> {
+    thumbnails::frame(name).or_else(|| capture::frame(name))
+}
 /// Live windows copied on the card: the buffers asked of the render, its
 /// answers, and which of them are still in use.
 #[cfg(target_os = "linux")]

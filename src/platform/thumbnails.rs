@@ -310,14 +310,15 @@ impl Wanted {
     }
 }
 
-/// A memory buffer the compositor copies a window into.
-struct Shm {
-    buffer: wl_buffer::WlBuffer,
+/// A memory buffer the compositor copies a window into (or, for `capture`, a
+/// monitor).
+pub(super) struct Shm {
+    pub(super) buffer: wl_buffer::WlBuffer,
     pool: wl_shm_pool::WlShmPool,
     map: *mut u8,
     len: usize,
-    size: (u32, u32),
-    format: wl_shm::Format,
+    pub(super) size: (u32, u32),
+    pub(super) format: wl_shm::Format,
 }
 
 // SAFETY: the map is only touched with the state's lock held.
@@ -333,7 +334,10 @@ impl Drop for Shm {
 }
 
 impl Shm {
-    fn new(shm: &wl_shm::WlShm, size: (u32, u32), format: wl_shm::Format, qh: &QueueHandle<State>) -> Option<Shm> {
+    pub(super) fn new<D>(shm: &wl_shm::WlShm, size: (u32, u32), format: wl_shm::Format, qh: &QueueHandle<D>) -> Option<Shm>
+    where
+        D: Dispatch<wl_shm_pool::WlShmPool, ()> + Dispatch<wl_buffer::WlBuffer, ()> + 'static,
+    {
         let (w, h) = size;
         let stride = w as usize * 4;
         let len = stride * h as usize;
@@ -360,6 +364,12 @@ impl Shm {
         let pool = shm.create_pool(fd.as_fd(), len as i32, qh, ());
         let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, qh, ());
         Some(Shm { buffer, pool, map: map as *mut u8, len, size, format })
+    }
+
+    /// What the compositor left in it, `size.0 * 4` bytes a row.
+    pub(super) fn bytes(&self) -> &[u8] {
+        // SAFETY: mapped by `new` with this length, for as long as `self`.
+        unsafe { std::slice::from_raw_parts(self.map, self.len) }
     }
 }
 

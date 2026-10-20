@@ -1,0 +1,627 @@
+//! `capture`: what is on a monitor, asked for by the logic. Two questions,
+//! both answered at once (`sys.ask`), both with `services: "capture"`:
+//!
+//! - `capture.pixel(x, y[, output])`: the colour at a point, `"#rrggbb"`. A
+//!   colour picker. Without `output`, `x` and `y` are on the desktop, in the
+//!   compositor's logical units (the monitor that holds the point is found);
+//!   with it, inside that monitor (`screen.name`), as a full-screen surface's
+//!   pointer reads them.
+//! - `capture.freeze(output)`: the whole monitor, as it is now, kept in memory
+//!   and named `capture:DP-1?3`, which `image … = from` paints like a live
+//!   window's frame. What a region picker draws under its rectangle, so that
+//!   what is picked does not move while it is picked. A monitor's last freeze
+//!   is kept until the next one of that monitor replaces it.
+//!
+//! Spoken in the standard protocols, on a connection of its own (a monitor
+//! that goes away halfway through a copy can at worst end this connection,
+//! never the one the scene draws on): wlr-screencopy, which wlroots
+//! compositors, Hyprland, niri and pleamar-wm ship, and ext-image-copy-capture
+//! with its output source where the compositor has it. A pixel is asked of
+//! wlr-screencopy first, as a region one logical unit wide (the compositor
+//! scales and turns it); a freeze, of ext-image-copy-capture first. Either one
+//! alone is enough. xdg-output says where each monitor is and how big, in
+//! logical units.
+//!
+//! Surfaces with `captures: hidden` are left out by the compositor that
+//! honours it (pleamar-wm does, for every capture): nothing to do here.
+
+use super::thumbnails::{Frame, Shm};
+use super::SysValue;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_output, wl_registry, wl_shm, wl_shm_pool};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1, ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_frame_v1::{self as copy_frame, ExtImageCopyCaptureFrameV1},
+    ext_image_copy_capture_manager_v1::{self as copy_manager, ExtImageCopyCaptureManagerV1},
+    ext_image_copy_capture_session_v1::{self as copy_session, ExtImageCopyCaptureSessionV1},
+};
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+};
+
+/// How long the compositor has to answer one question.
+const WAIT: Duration = Duration::from_secs(2);
+
+/// Every monitor's last freeze, by its name.
+static FROZEN: Mutex<Option<HashMap<String, Arc<Frame>>>> = Mutex::new(None);
+/// Each freeze's version: one counter for all, so a name is never reused.
+static VERSION: AtomicU64 = AtomicU64::new(0);
+/// The connection, made the first time it is asked, and again if it ends.
+static LINK: Mutex<Option<Link>> = Mutex::new(None);
+
+/// The frame a `capture:DP-1` names (without its version), if it was frozen.
+pub fn frame(name: &str) -> Option<Arc<Frame>> {
+    let output = name.strip_prefix("capture:")?;
+    FROZEN.lock().unwrap().as_ref()?.get(output).cloned()
+}
+
+/// `sys.ask("capture.pixel", …)` and `sys.ask("capture.freeze", …)`.
+pub fn query(name: &str, args: &[SysValue]) -> Result<SysValue, String> {
+    match (name, args) {
+        ("capture.pixel", [SysValue::Num(x), SysValue::Num(y)]) => with_link(|l| l.pixel(*x, *y, None)).map(SysValue::Text),
+        ("capture.pixel", [SysValue::Num(x), SysValue::Num(y), SysValue::Text(o)]) => with_link(|l| l.pixel(*x, *y, Some(o))).map(SysValue::Text),
+        ("capture.pixel", _) => Err("`capture.pixel` takes a point, and a monitor if the point is inside it: sys.ask(\"capture.pixel\", x, y[, screen.name])".into()),
+        ("capture.freeze", [SysValue::Text(o)]) => with_link(|l| l.freeze(o)).map(SysValue::Text),
+        ("capture.freeze", _) => Err("`capture.freeze` takes the monitor to keep: sys.ask(\"capture.freeze\", screen.name)".into()),
+        _ => Err(format!("this system cannot answer '{name}' yet")),
+    }
+}
+
+fn with_link<T>(ask: impl FnOnce(&mut Link) -> Result<T, Asked>) -> Result<T, String> {
+    let mut held = LINK.lock().unwrap();
+    if held.is_none() {
+        *held = Some(Link::connect()?);
+    }
+    match ask(held.as_mut().unwrap()) {
+        Ok(v) => Ok(v),
+        Err(Asked::No(why)) => Err(why),
+        // The connection is not to be trusted any more: a new one next time.
+        Err(Asked::Lost(why)) => {
+            *held = None;
+            Err(why)
+        }
+    }
+}
+
+/// Why a question was not answered: the answer is no, or the connection is gone.
+enum Asked {
+    No(String),
+    Lost(String),
+}
+
+impl From<String> for Asked {
+    fn from(why: String) -> Asked {
+        Asked::No(why)
+    }
+}
+
+struct Link {
+    connection: Connection,
+    queue: EventQueue<State>,
+    qh: QueueHandle<State>,
+    state: State,
+}
+
+#[derive(Default)]
+struct State {
+    outputs: Vec<Output>,
+    shm: Option<wl_shm::WlShm>,
+    wlr: Option<ZwlrScreencopyManagerV1>,
+    sources: Option<ExtOutputImageCaptureSourceManagerV1>,
+    copies: Option<ExtImageCopyCaptureManagerV1>,
+    xdg: Option<ZxdgOutputManagerV1>,
+    synced: bool,
+    shot: Shot,
+}
+
+/// A monitor, as the compositor describes it.
+struct Output {
+    global: u32,
+    wl: wl_output::WlOutput,
+    xdg: Option<ZxdgOutputV1>,
+    name: String,
+    /// Where and how big, in logical units.
+    at: (i32, i32),
+    size: (i32, i32),
+    transform: u32,
+}
+
+/// The copy under way, as far as it has got.
+#[derive(Default)]
+struct Shot {
+    /// The layouts the compositor offers: format and size.
+    offers: Vec<(wl_shm::Format, (u32, u32))>,
+    /// wlr: every layout said (`buffer_done`, or the first one on version 1 and 2).
+    described: bool,
+    /// ext: the size and the formats, until `done` makes them offers.
+    size: Option<(u32, u32)>,
+    formats: Vec<wl_shm::Format>,
+    y_invert: bool,
+    transform: Option<u32>,
+    ready: bool,
+    failed: Option<String>,
+}
+
+impl Link {
+    fn connect() -> Result<Link, String> {
+        let connection = Connection::connect_to_env().map_err(|_| "capture needs a Wayland compositor".to_string())?;
+        let mut queue = connection.new_event_queue::<State>();
+        let qh = queue.handle();
+        connection.display().get_registry(&qh, ());
+        let mut state = State::default();
+        queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+        // Monitors announced before the xdg-output manager.
+        if let Some(xdg) = &state.xdg {
+            for o in state.outputs.iter_mut().filter(|o| o.xdg.is_none()) {
+                o.xdg = Some(xdg.get_xdg_output(&o.wl, &qh, o.global));
+            }
+        }
+        queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+        if state.shm.is_none() || (state.wlr.is_none() && (state.sources.is_none() || state.copies.is_none())) {
+            return Err("this compositor does not let a program copy the screen (neither wlr-screencopy nor ext-image-copy-capture)".into());
+        }
+        Ok(Link { connection, queue, qh, state })
+    }
+
+    /// Answers until `done` says so, or `WAIT` passes.
+    fn wait(&mut self, done: impl Fn(&State) -> bool) -> Result<(), Asked> {
+        let until = Instant::now() + WAIT;
+        let lost = |e: &dyn std::fmt::Display| Asked::Lost(format!("the compositor's connection ended: {e}"));
+        loop {
+            self.queue.dispatch_pending(&mut self.state).map_err(|e| lost(&e))?;
+            if done(&self.state) {
+                return Ok(());
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Asked::Lost("the compositor did not answer".into()));
+            }
+            self.connection.flush().map_err(|e| lost(&e))?;
+            let Some(guard) = self.queue.prepare_read() else { continue };
+            {
+                use std::os::fd::AsRawFd;
+                let mut fds = [libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+                // SAFETY: a pollfd of our own, for as long as the call.
+                unsafe { libc::poll(fds.as_mut_ptr(), 1, left.as_millis().clamp(1, i32::MAX as u128) as i32) };
+            }
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(lost(&e)),
+            }
+        }
+    }
+
+    /// The monitors as they are now: one turn with the compositor, so that one
+    /// unplugged a moment ago is not asked for.
+    fn sync(&mut self) -> Result<(), Asked> {
+        self.state.synced = false;
+        self.connection.display().sync(&self.qh, ());
+        self.wait(|s| s.synced)
+    }
+
+    fn output(&self, name: &str) -> Result<&Output, Asked> {
+        self.state.outputs.iter().find(|o| o.name == name).ok_or_else(|| {
+            let known: Vec<_> = self.state.outputs.iter().map(|o| o.name.as_str()).collect();
+            Asked::No(format!("there is no monitor '{name}' (there are: {})", known.join(", ")))
+        })
+    }
+
+    fn pixel(&mut self, x: f64, y: f64, output: Option<&str>) -> Result<String, Asked> {
+        self.sync()?;
+        let (o, lx, ly) = match output {
+            Some(name) => (self.output(name)?, x.floor() as i32, y.floor() as i32),
+            None => {
+                let at = (x.floor() as i32, y.floor() as i32);
+                let rects: Vec<_> = self.state.outputs.iter().map(|o| (o.at, o.size)).collect();
+                let k = holding(&rects, at).ok_or_else(|| Asked::No(format!("no monitor holds the point {x}, {y}")))?;
+                let o = &self.state.outputs[k];
+                (o, at.0 - o.at.0, at.1 - o.at.1)
+            }
+        };
+        if lx < 0 || ly < 0 || lx >= o.size.0 || ly >= o.size.1 {
+            return Err(Asked::No(format!("{x}, {y} is outside the monitor '{}' ({} × {})", o.name, o.size.0, o.size.1)));
+        }
+        let (wl, size) = (o.wl.clone(), o.size);
+        if let Some(wlr) = self.state.wlr.clone() {
+            // One logical unit: however many pixels the compositor makes of it,
+            // they are the same colour; the middle one.
+            let frame = wlr.capture_output_region(0, &wl, lx, ly, 1, 1, &self.qh, ());
+            let (px, w, h) = self.copy_wlr(frame, &wl)?;
+            return Ok(hex(&px[((h / 2) * w + w / 2) as usize * 4..]));
+        }
+        let (px, w, h) = self.copy_ext(&wl)?;
+        // In the monitor's pixels, which may be more than its units.
+        let sx = ((lx as f64 + 0.5) * w as f64 / size.0.max(1) as f64) as u32;
+        let sy = ((ly as f64 + 0.5) * h as f64 / size.1.max(1) as f64) as u32;
+        Ok(hex(&px[(sy.min(h - 1) * w + sx.min(w - 1)) as usize * 4..]))
+    }
+
+    fn freeze(&mut self, name: &str) -> Result<String, Asked> {
+        self.sync()?;
+        let wl = self.output(name)?.wl.clone();
+        let (pixels, width, height) = match (&self.state.sources, &self.state.copies) {
+            (Some(_), Some(_)) => self.copy_ext(&wl)?,
+            _ => {
+                let frame = self.state.wlr.as_ref().unwrap().capture_output(0, &wl, &self.qh, ());
+                self.copy_wlr(frame, &wl)?
+            }
+        };
+        let version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
+        let frame = Arc::new(Frame { version, width, height, pixels, opaque: true, card: None });
+        FROZEN.lock().unwrap().get_or_insert_with(HashMap::new).insert(name.to_owned(), frame);
+        Ok(format!("capture:{name}?{version}"))
+    }
+
+    /// A wlr-screencopy frame, copied and made upright: blue, green, red, alpha.
+    fn copy_wlr(&mut self, frame: ZwlrScreencopyFrameV1, wl: &wl_output::WlOutput) -> Result<(Vec<u8>, u32, u32), Asked> {
+        self.state.shot = Shot::default();
+        let got = self.wait(|s| s.shot.described || s.shot.failed.is_some());
+        let shm = got.and_then(|_| self.buffer());
+        let shm = match shm {
+            Ok(shm) => shm,
+            Err(e) => {
+                frame.destroy();
+                return Err(e);
+            }
+        };
+        frame.copy(&shm.buffer);
+        let got = self.wait(|s| s.shot.ready || s.shot.failed.is_some());
+        frame.destroy();
+        got?;
+        if let Some(why) = self.state.shot.failed.take() {
+            return Err(Asked::No(why));
+        }
+        // The monitor's own transform, as grim does: wlr-screencopy does not say it.
+        let transform = self.state.outputs.iter().find(|o| &o.wl == wl).map_or(0, |o| o.transform);
+        Ok(self.finish(&shm, transform))
+    }
+
+    /// An ext-image-copy-capture copy of the whole monitor, made upright.
+    fn copy_ext(&mut self, wl: &wl_output::WlOutput) -> Result<(Vec<u8>, u32, u32), Asked> {
+        let (Some(sources), Some(copies)) = (self.state.sources.clone(), self.state.copies.clone()) else {
+            return Err(Asked::No("this compositor copies no whole monitor".into()));
+        };
+        self.state.shot = Shot::default();
+        let source = sources.create_source(wl, &self.qh, ());
+        let session = copies.create_session(&source, copy_manager::Options::empty(), &self.qh, ());
+        let ended = |source: ExtImageCaptureSourceV1, session: ExtImageCopyCaptureSessionV1| {
+            session.destroy();
+            source.destroy();
+        };
+        let shm = self.wait(|s| s.shot.described || s.shot.failed.is_some()).and_then(|_| self.buffer());
+        let shm = match shm {
+            Ok(shm) => shm,
+            Err(e) => {
+                ended(source, session);
+                return Err(e);
+            }
+        };
+        let frame = session.create_frame(&self.qh, ());
+        frame.attach_buffer(&shm.buffer);
+        frame.damage_buffer(0, 0, shm.size.0 as i32, shm.size.1 as i32);
+        frame.capture();
+        let got = self.wait(|s| s.shot.ready || s.shot.failed.is_some());
+        frame.destroy();
+        ended(source, session);
+        got?;
+        if let Some(why) = self.state.shot.failed.take() {
+            return Err(Asked::No(why));
+        }
+        let transform = self.state.shot.transform.unwrap_or(0);
+        Ok(self.finish(&shm, transform))
+    }
+
+    /// A buffer in a layout the compositor offered and this reads.
+    fn buffer(&mut self) -> Result<Shm, Asked> {
+        if let Some(why) = self.state.shot.failed.take() {
+            return Err(Asked::No(why));
+        }
+        let shm = self.state.shm.clone().ok_or_else(|| Asked::No("no shared memory".into()))?;
+        let Some(&(format, size)) = self.state.shot.offers.iter().find(|(f, _)| reads(*f)) else {
+            return Err(Asked::No("the compositor offers the screen in no layout of 8 bits a colour".into()));
+        };
+        Shm::new(&shm, size, format, &self.qh).ok_or_else(|| Asked::No("no memory for the copy".into()))
+    }
+
+    fn finish(&mut self, shm: &Shm, transform: u32) -> (Vec<u8>, u32, u32) {
+        let (w, h) = shm.size;
+        let mut px = shm.bytes().to_vec();
+        if matches!(shm.format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888) {
+            for p in px.chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+        }
+        if self.state.shot.y_invert {
+            px = flip_rows(&px, w, h);
+        }
+        upright(px, w, h, transform)
+    }
+}
+
+/// The layouts read here: 8 bits a colour, in either order.
+fn reads(f: wl_shm::Format) -> bool {
+    matches!(f, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 | wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888)
+}
+
+/// `"#rrggbb"` of the pixel at the start of `px` (blue, green, red, alpha).
+fn hex(px: &[u8]) -> String {
+    format!("#{:02x}{:02x}{:02x}", px[2], px[1], px[0])
+}
+
+/// Which of the monitors (where, how big) holds the point.
+fn holding(rects: &[((i32, i32), (i32, i32))], (x, y): (i32, i32)) -> Option<usize> {
+    rects.iter().position(|&((ox, oy), (w, h))| x >= ox && y >= oy && x < ox + w && y < oy + h)
+}
+
+fn flip_rows(px: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let row = w as usize * 4;
+    px.chunks_exact(row).take(h as usize).rev().flatten().copied().collect()
+}
+
+/// The copy as it is seen. A copy comes the way the monitor's pixels are laid
+/// out: with the monitor's transform (`wl_output.transform`, 0 to 7, turned
+/// counter-clockwise, then 4 to 7 flipped too) already applied to what is
+/// seen, as a client's buffer with that `buffer_transform`. Undone here.
+fn upright(px: Vec<u8>, w: u32, h: u32, transform: u32) -> (Vec<u8>, u32, u32) {
+    // Undone: a quarter turn the other way; a flip is its own undoing.
+    let undo = match transform {
+        1 => 3,
+        3 => 1,
+        t => t,
+    };
+    if undo == 0 || undo > 7 {
+        return (px, w, h);
+    }
+    let (w, h) = (w as usize, h as usize);
+    let turned = matches!(undo, 1 | 3 | 5 | 7);
+    let (dw, dh) = if turned { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; px.len()];
+    for y in 0..h {
+        for x in 0..w {
+            // Flipped first, left to right, then turned.
+            let fx = if undo >= 4 { w - 1 - x } else { x };
+            let (dx, dy) = match undo & 3 {
+                0 => (fx, y),
+                1 => (y, w - 1 - fx),
+                2 => (w - 1 - fx, h - 1 - y),
+                _ => (h - 1 - y, fx),
+            };
+            let (s, d) = ((y * w + x) * 4, (dy * dw + dx) * 4);
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    (out, dw as u32, dh as u32)
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
+    fn event(e: &mut Self, registry: &wl_registry::WlRegistry, ev: wl_registry::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        match ev {
+            wl_registry::Event::Global { name, interface, version } => match interface.as_str() {
+                "wl_output" => {
+                    let wl: wl_output::WlOutput = registry.bind(name, version.min(4), qh, name);
+                    let xdg = e.xdg.as_ref().map(|m| m.get_xdg_output(&wl, qh, name));
+                    e.outputs.push(Output { global: name, wl, xdg, name: String::new(), at: (0, 0), size: (0, 0), transform: 0 });
+                }
+                "zxdg_output_manager_v1" => e.xdg = Some(registry.bind(name, version.min(3), qh, ())),
+                "wl_shm" => e.shm = Some(registry.bind(name, 1, qh, ())),
+                "zwlr_screencopy_manager_v1" => e.wlr = Some(registry.bind(name, version.min(3), qh, ())),
+                "ext_output_image_capture_source_manager_v1" => e.sources = Some(registry.bind(name, 1, qh, ())),
+                "ext_image_copy_capture_manager_v1" => e.copies = Some(registry.bind(name, 1, qh, ())),
+                _ => {}
+            },
+            wl_registry::Event::GlobalRemove { name } => {
+                if let Some(k) = e.outputs.iter().position(|o| o.global == name) {
+                    let o = e.outputs.remove(k);
+                    if let Some(x) = o.xdg {
+                        x.destroy();
+                    }
+                    if o.wl.version() >= 3 {
+                        o.wl.release();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, u32> for State {
+    fn event(e: &mut Self, wl: &wl_output::WlOutput, ev: wl_output::Event, _: &u32, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(o) = e.outputs.iter_mut().find(|o| &o.wl == wl) else { return };
+        match ev {
+            wl_output::Event::Geometry { transform: WEnum::Value(t), .. } => o.transform = t as u32,
+            wl_output::Event::Name { name } => o.name = name,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, u32> for State {
+    fn event(e: &mut Self, _: &ZxdgOutputV1, ev: zxdg_output_v1::Event, global: &u32, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(o) = e.outputs.iter_mut().find(|o| o.global == *global) else { return };
+        match ev {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => o.at = (x, y),
+            zxdg_output_v1::Event::LogicalSize { width, height } => o.size = (width, height),
+            // Before version 4 of wl_output, the only place it is said.
+            zxdg_output_v1::Event::Name { name } if o.name.is_empty() => o.name = name,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(e: &mut Self, _: &wl_callback::WlCallback, ev: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_callback::Event::Done { .. } = ev {
+            e.synced = true;
+        }
+    }
+}
+
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
+    fn event(e: &mut Self, frame: &ZwlrScreencopyFrameV1, ev: zwlr_screencopy_frame_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        use zwlr_screencopy_frame_v1::Event as E;
+        let shot = &mut e.shot;
+        match ev {
+            E::Buffer { format: WEnum::Value(format), width, height, stride } => {
+                // A buffer of ours is `width * 4` a row: an offer of any other is no use.
+                if stride == width * 4 {
+                    shot.offers.push((format, (width, height)));
+                }
+                // Before version 3 there is no `buffer_done`: this is all.
+                if frame.version() < 3 {
+                    shot.described = true;
+                }
+            }
+            E::BufferDone => shot.described = true,
+            E::Flags { flags: WEnum::Value(f) } => shot.y_invert = f.contains(zwlr_screencopy_frame_v1::Flags::YInvert),
+            E::Ready { .. } => shot.ready = true,
+            E::Failed => shot.failed = Some("the compositor would not copy the screen".into()),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
+    fn event(e: &mut Self, _: &ExtImageCopyCaptureSessionV1, ev: copy_session::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        let shot = &mut e.shot;
+        match ev {
+            copy_session::Event::BufferSize { width, height } => shot.size = Some((width, height)),
+            copy_session::Event::ShmFormat { format: WEnum::Value(f) } => shot.formats.push(f),
+            copy_session::Event::Done => {
+                if let Some(size) = shot.size {
+                    shot.offers = shot.formats.iter().map(|&f| (f, size)).collect();
+                }
+                shot.described = true;
+            }
+            copy_session::Event::Stopped => {
+                if !shot.ready {
+                    shot.failed = Some("the compositor stopped copying the monitor".into());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
+    fn event(e: &mut Self, _: &ExtImageCopyCaptureFrameV1, ev: copy_frame::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        let shot = &mut e.shot;
+        match ev {
+            copy_frame::Event::Transform { transform: WEnum::Value(t) } => shot.transform = Some(t as u32),
+            copy_frame::Event::Ready => shot.ready = true,
+            copy_frame::Event::Failed { reason } => shot.failed = Some(format!("the compositor would not copy the monitor ({reason:?})")),
+            _ => {}
+        }
+    }
+}
+
+macro_rules! ignore {
+    ($($t:ty),*) => {$(
+        impl Dispatch<$t, ()> for State {
+            fn event(_: &mut Self, _: &$t, _: <$t as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        }
+    )*};
+}
+ignore!(
+    ZxdgOutputManagerV1,
+    ZwlrScreencopyManagerV1,
+    ExtOutputImageCaptureSourceManagerV1,
+    ExtImageCaptureSourceV1,
+    ExtImageCopyCaptureManagerV1,
+    wl_shm::WlShm,
+    wl_shm_pool::WlShmPool,
+    wl_buffer::WlBuffer
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `w` × `h` copy whose every pixel says where it is: blue = x, green = y.
+    fn marked(w: u32, h: u32) -> Vec<u8> {
+        (0..h).flat_map(|y| (0..w).flat_map(move |x| [x as u8, y as u8, 0, 255])).collect()
+    }
+
+    fn at(px: &[u8], w: u32, x: u32, y: u32) -> (u8, u8) {
+        let i = ((y * w + x) * 4) as usize;
+        (px[i], px[i + 1])
+    }
+
+    #[test]
+    fn a_pixel_is_red_green_blue_in_that_order() {
+        assert_eq!(hex(&[0x10, 0x80, 0xff, 0xff]), "#ff8010");
+    }
+
+    #[test]
+    fn the_point_is_found_on_its_monitor() {
+        let two = [((0, 0), (1920, 1080)), ((1920, 0), (1280, 1024))];
+        assert_eq!(holding(&two, (0, 0)), Some(0));
+        assert_eq!(holding(&two, (1919, 1079)), Some(0));
+        assert_eq!(holding(&two, (1920, 5)), Some(1));
+        assert_eq!(holding(&two, (2000, 1050)), None, "below the smaller one");
+        assert_eq!(holding(&two, (-1, 0)), None);
+    }
+
+    #[test]
+    fn a_copy_upside_down_is_turned_over() {
+        let px = flip_rows(&marked(3, 2), 3, 2);
+        assert_eq!(at(&px, 3, 0, 0), (0, 1));
+        assert_eq!(at(&px, 3, 2, 1), (2, 0));
+    }
+
+    #[test]
+    fn an_upright_monitor_is_left_alone() {
+        let (px, w, h) = upright(marked(3, 2), 3, 2, 0);
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(px, marked(3, 2));
+    }
+
+    #[test]
+    fn a_turned_monitor_is_turned_back() {
+        // What a monitor turned 90 lays out: what is seen, turned a quarter
+        // counter-clockwise. Turned back, the top left of the copy (seen at the
+        // top right) goes to the top right again.
+        let (px, w, h) = upright(marked(3, 2), 3, 2, 1);
+        assert_eq!((w, h), (2, 3));
+        assert_eq!(at(&px, w, 1, 0), (0, 0));
+        assert_eq!(at(&px, w, 0, 0), (0, 1));
+        assert_eq!(at(&px, w, 0, 2), (2, 1));
+        // 270 and 90 undo each other; twice 180 is nothing.
+        let (back, w2, h2) = upright(upright(marked(3, 2), 3, 2, 1).0, 2, 3, 3);
+        assert_eq!((w2, h2), (3, 2));
+        assert_eq!(back, marked(3, 2));
+        let (half, ..) = upright(marked(3, 2), 3, 2, 2);
+        assert_eq!(upright(half, 3, 2, 2).0, marked(3, 2));
+    }
+
+    #[test]
+    fn a_flipped_monitor_is_flipped_back() {
+        for t in 4..8 {
+            let (once, w, h) = upright(marked(3, 2), 3, 2, t);
+            assert_eq!(upright(once, w, h, t).0, marked(3, 2), "transform {t} is its own undoing");
+        }
+        let (px, ..) = upright(marked(3, 2), 3, 2, 4);
+        assert_eq!(at(&px, 3, 0, 0), (2, 0));
+    }
+
+    #[test]
+    fn a_frozen_monitor_is_found_by_its_name() {
+        let f = Arc::new(Frame { version: 7, width: 1, height: 1, pixels: vec![0; 4], opaque: true, card: None });
+        FROZEN.lock().unwrap().get_or_insert_with(HashMap::new).insert("TEST-9".into(), f);
+        assert_eq!(frame("capture:TEST-9").map(|f| f.version), Some(7));
+        assert!(frame("capture:TEST-8").is_none());
+        assert!(frame("thumbnails:9").is_none());
+    }
+}
