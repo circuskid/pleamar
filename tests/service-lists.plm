@@ -15,7 +15,7 @@ scene ServiceLists {
     model wins max 8 { title: text; class: text; minimized: bool }
     model spaces max 10 { id: number; name: text; active: bool }
     model launchers max 40 { name: text; exec: text; icon: image 24, 24; keywords: text; terminal: bool; list actions max 4 { name: text; exec: text } }
-    model icons max 12 { key: text; title: text; icon: image 18, 18 }
+    model icons max 12 { key: text; title: text; icon: image 18, 18; tooltip: text; tooltip_body: text }
     model notices max 14 { app: text; title: text; body: text; image: image 32, 32; time: number }
     model missed max 20 { app: text; title: text }
     model choices max 8 { id: text; name: text; playing: bool; chosen: bool }

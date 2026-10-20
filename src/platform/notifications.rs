@@ -128,8 +128,9 @@ impl Hub {
     }
 }
 
-/// We say we do not understand markup, but some send it anyway.
-fn strip_markup(s: &str) -> String {
+/// We say we do not understand markup, but some send it anyway. The tray's
+/// tooltips are read with it too.
+pub(super) fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut inside = false;
     for c in s.chars() {

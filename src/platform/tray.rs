@@ -6,10 +6,11 @@
 //! shows the icons, and there can be several. If nobody is the watcher, we are;
 //! if someone else already is (another bar), we ask it: the tray shows up all the same.
 //!
-//! `{ { key, id, title, status, icon, menu }, … }`. `icon` is an icon name
-//! or a path: it works as is for `image … = from`. `status`: Active, Passive,
-//! NeedsAttention. On Windows it will be `Shell_NotifyIcon`; on macOS, `NSStatusItem`
-//! does not let you see other apps' ones.
+//! `{ { key, id, title, status, icon, menu, tooltip, tooltip_body }, … }`. `icon`
+//! is an icon name or a path: it works as is for `image … = from`. `status`:
+//! Active, Passive, NeedsAttention. `tooltip` and `tooltip_body` are what the
+//! application says on hover, `""` when it says nothing. On Windows it will be
+//! `Shell_NotifyIcon`; on macOS, `NSStatusItem` does not let you see other apps' ones.
 
 use super::SysValue;
 use std::hash::{Hash, Hasher};
@@ -138,6 +139,46 @@ fn list(c: &Connection, own: Option<&Mutex<Registry>>) -> Vec<String> {
     }
 }
 
+/// A tooltip's description may carry a little markup, and a text paints none
+/// of it. The spec allows `<b>`, `<i>`, `<u>`, `<a href>` and `<img alt>`, in
+/// the description only: the words stay, an image becomes its `alt`, and the
+/// rest of the tag goes, as with a notification's body. `<br>` is not in the
+/// spec but common, and is a new line. A `<` that starts no tag (`a < b`,
+/// `<3`) is the character itself.
+fn plain(markup: &str) -> String {
+    let mut lines = String::with_capacity(markup.len());
+    let mut rest = markup;
+    while let Some(k) = rest.find('<') {
+        lines.push_str(&rest[..k]);
+        rest = &rest[k..];
+        let opens = rest[1..].trim_start_matches('/').starts_with(|c: char| c.is_ascii_alphabetic());
+        let Some(end) = rest.find('>').filter(|_| opens) else {
+            // strip_markup would take it for a tag: it is read back as `<`.
+            lines.push_str("&lt;");
+            rest = &rest[1..];
+            continue;
+        };
+        let tag = &rest[..=end];
+        let name: String = tag[1..].trim_start_matches('/').chars().take_while(char::is_ascii_alphabetic).collect();
+        if name.eq_ignore_ascii_case("br") {
+            lines.push('\n');
+        } else if name.eq_ignore_ascii_case("img") {
+            lines.push_str(alt(tag));
+        }
+        rest = &rest[end + 1..];
+    }
+    lines.push_str(rest);
+    super::notifications::strip_markup(&lines).trim().to_owned()
+}
+
+/// An `<img>`'s `alt`, which the spec makes mandatory; `""` if it has none.
+fn alt(tag: &str) -> &str {
+    let Some(k) = tag.find(" alt=") else { return "" };
+    let value = &tag[k + 5..];
+    let Some(quote) = value.chars().next().filter(|q| *q == '"' || *q == '\'') else { return "" };
+    value[1..].split(quote).next().unwrap_or("")
+}
+
 fn report(c: &Connection, own: Option<&Mutex<Registry>>) -> SysValue {
     let mut gone = Vec::new();
     let v = list(c, own).into_iter().filter_map(|full| {
@@ -149,6 +190,8 @@ fn report(c: &Connection, own: Option<&Mutex<Registry>>) -> SysValue {
         };
         let title: String = p.get_property("Title").unwrap_or_default();
         let menu = p.get_property::<zbus::zvariant::OwnedObjectPath>("Menu").is_ok_and(|m| m.as_str() != "/" && !m.as_str().is_empty());
+        // (icon name, icon pixels, title, description): only the words are taken.
+        let (_, _, tip, tip_body) = p.get_property::<(String, Vec<(i32, i32, Vec<u8>)>, String, String)>("ToolTip").unwrap_or_default();
         Some(SysValue::Map(vec![
             ("key".into(), SysValue::Text(full)),
             ("title".into(), SysValue::Text(if title.is_empty() { id.clone() } else { title })),
@@ -156,6 +199,8 @@ fn report(c: &Connection, own: Option<&Mutex<Registry>>) -> SysValue {
             ("status".into(), SysValue::Text(p.get_property("Status").unwrap_or_else(|_| "Active".to_owned()))),
             ("icon".into(), SysValue::Text(icon_of(&p))),
             ("menu".into(), SysValue::Bool(menu)),
+            ("tooltip".into(), SysValue::Text(tip)),
+            ("tooltip_body".into(), SysValue::Text(plain(&tip_body))),
         ]))
     }).collect();
     if let Some(a) = own {
@@ -191,7 +236,8 @@ pub fn service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
     registry.lock().unwrap().updates = Some(tx.clone());
     let _ = RESCAN.set(Mutex::new(tx.clone()));
 
-    // Three things mean we have to look again: an icon changing, the
+    // Three things mean we have to look again: an icon changing (`NewIcon`,
+    // `NewTitle`, `NewToolTip`, `NewStatus`… every signal of the item), the
     // watcher (if it is someone else) registering or removing someone, and someone leaving the bus.
     let signal = |interface: &'static str, member: Option<&'static str>| {
         let b = MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(interface).ok()?;
@@ -318,4 +364,49 @@ pub fn command(what: &str, args: &[SysValue]) -> Result<(), String> {
         _ => return Err(format!("'{what}' does not exist: tray.activate, tray.secondary, tray.context, tray.scroll, tray.menu_click")),
     };
     result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain;
+
+    #[test]
+    fn a_tooltip_body_is_read_as_plain_text() {
+        assert_eq!(plain("3 new messages"), "3 new messages");
+        assert_eq!(plain("<b>Telegram</b><br/>3 new &amp; 1 <i>muted</i>"), "Telegram\n3 new & 1 muted");
+        assert_eq!(plain("one<BR>two<br />three"), "one\ntwo\nthree");
+        assert_eq!(plain("<a href=\"https://example.org\">a link</a> <img src=\"x.png\"/>"), "a link");
+        assert_eq!(plain("<u>under</u>lined"), "underlined");
+        assert_eq!(plain("  <p>padded</p>\n"), "padded");
+        assert_eq!(plain(""), "");
+    }
+
+    #[test]
+    fn a_tooltip_body_reads_its_entities() {
+        assert_eq!(plain("&lt;b&gt; is not bold"), "<b> is not bold");
+        assert_eq!(plain("say &quot;hi&quot; &apos;there&apos;"), "say \"hi\" 'there'");
+    }
+
+    #[test]
+    fn a_br_at_either_end_is_no_line() {
+        assert_eq!(plain("<br/>first"), "first");
+        assert_eq!(plain("last<br>"), "last");
+        assert_eq!(plain("<br><br>middle<br />"), "middle");
+    }
+
+    #[test]
+    fn a_bare_less_than_stays() {
+        assert_eq!(plain("1 < 2"), "1 < 2");
+        assert_eq!(plain("a < b and <b>c</b>"), "a < b and c");
+        assert_eq!(plain("I <3 it"), "I <3 it");
+        assert_eq!(plain("ends in <"), "ends in <");
+        assert_eq!(plain("<b never closed"), "<b never closed");
+    }
+
+    #[test]
+    fn an_image_is_its_alt() {
+        assert_eq!(plain("<img src=\"/x.png\" alt=\"[new]\"/> mail"), "[new] mail");
+        assert_eq!(plain("<img alt='a &amp; b' src='/x.png'>"), "a & b");
+        assert_eq!(plain("<img src=\"/x.png\"/>"), "");
+    }
 }
