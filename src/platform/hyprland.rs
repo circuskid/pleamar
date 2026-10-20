@@ -165,10 +165,12 @@ fn window() -> SysValue {
     ])
 }
 
-/// Whether a window is fullscreen, and whether maximized. Hyprland says both in
-/// `fullscreen`, a number since 0.42 (0 none, 1 maximized, 2 fullscreen; read as
-/// bits, as when 3 meant both); before, `fullscreen` was `true` for either and
-/// `fullscreenMode` (0 fullscreen, 1 maximized) said which.
+/// Whether a window is fullscreen, and whether maximized, from its `fullscreen`
+/// in `j/activewindow` (`fullscreenClient`, what the program asked for, is not
+/// read). From Hyprland 0.42 it is a number: 0 none, 1 maximized, 2 fullscreen.
+/// It is read as bits because in 0.42 the modes were flags, and 3 was both.
+/// Up to 0.41 it was a boolean, and `fullscreenMode` said which (0 fullscreen,
+/// 1 maximized). Anything else, or no window, is neither.
 fn fullscreen_mode(window: &serde_json::Value) -> (bool, bool) {
     match (window["fullscreen"].as_i64(), window["fullscreen"].as_bool()) {
         (Some(n), _) => (n & 2 != 0, n & 1 != 0),
