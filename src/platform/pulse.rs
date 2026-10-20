@@ -186,7 +186,7 @@ const LEVEL_RATE: u32 = 30;
 /// The loudest of what came, as 0..1: a packet is float samples, one per
 /// reading, little-endian.
 fn peak_of(bytes: &[u8]) -> f32 {
-    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs()).fold(0.0, f32::max).min(1.0)
+    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b).abs()).fold(0.0, f32::max).min(1.0)
 }
 
 /// What is told, and when: the loudest since the last time told, about
@@ -221,6 +221,28 @@ impl Meter {
             v
         })
     }
+
+    /// Nothing is playing, or the stream is gone or not there yet: 0, now.
+    /// A peak still held back for the cap is dropped, not told after it, and
+    /// the cap does not delay the 0. Told unless 0 is what was told last.
+    fn silence(&mut self) -> Option<f64> {
+        self.peak = 0.0;
+        self.when = None;
+        (self.told != Some(0.0)).then(|| {
+            self.told = Some(0.0);
+            0.0
+        })
+    }
+}
+
+/// The longest packet taken from the server. A reading is 4 bytes and an
+/// event a few dozen; a length past this is a stream out of step, not data.
+const LEVEL_PACKET_MAX: u32 = 1 << 20;
+
+fn tell_level(dispatch: &dyn Fn(SysValue), v: Option<f64>) {
+    if let Some(v) = v {
+        dispatch(SysValue::Map(vec![("level".into(), SysValue::Num(v))]));
+    }
 }
 
 /// `audio.level`: how loud what plays is, `{ level }`, 0..1, the loudest
@@ -239,16 +261,13 @@ pub fn level_service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
             let mut meter = Meter::new();
             // Silence until told otherwise: with the output suspended, the
             // server answers the stream only once something plays.
-            if let Some(v) = meter.feed(0.0, std::time::Instant::now()) {
-                dispatch(SysValue::Map(vec![("level".into(), SysValue::Num(v))]));
-            }
+            tell_level(&*dispatch, meter.silence());
             loop {
                 let mut run = || -> R<()> {
                     let mut p = Pulse::connect("pleamar level")?;
-                    // Told when the default output changes, on the same connection:
-                    // then it starts again, on the new one's monitor.
-                    p.ack(Command::Subscribe(protocol::SubscriptionMask::SERVER))?;
                     let (server, sinks, _) = p.state()?;
+                    // With no default output, the first one; a default named
+                    // later differs from none, so it is followed all the same.
                     let sink = sinks.iter().find(|s| Some(&s.name) == server.default_sink_name.as_ref()).or(sinks.first()).ok_or("there is no output")?;
                     let monitor = sink.monitor_source_index.ok_or("the output has no monitor")?;
                     let mut props = Props::new();
@@ -263,50 +282,69 @@ pub fn level_service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
                         props,
                         ..Default::default()
                     }))?;
+                    tell_level(&*dispatch, meter.silence());
+                    // Told when the default output changes, on this connection, asked
+                    // last: an event coming while a reply is awaited would be taken for
+                    // the reply. Its answer is read with the readings, below.
+                    p.send(&Command::Subscribe(protocol::SubscriptionMask::SERVER))?;
+                    // Whether the default is still the one, asked on a second
+                    // connection: this one carries the readings.
+                    let mut asker: Option<Pulse> = None;
+                    let moved = |asker: &mut Option<Pulse>| -> R<bool> {
+                        let a = match asker {
+                            Some(a) => a,
+                            None => asker.insert(Pulse::connect("pleamar level")?),
+                        };
+                        Ok(a.ask::<protocol::ServerInfo>(Command::GetServerInfo)?.default_sink_name != server.default_sink_name)
+                    };
                     // Nothing comes while the output is suspended or nothing plays
-                    // through it: that is a silence, and is told as one.
+                    // through it: that is a silence, and is told as one. It is only
+                    // a silence between two packets; a packet cut short is an error.
                     p.sock.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(250))).ok();
                     let mut buf = Vec::new();
                     loop {
-                        let desc = match protocol::read_descriptor(&mut p.sock) {
-                            Ok(d) => d,
-                            Err(protocol::ProtocolError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                                if let Some(v) = meter.feed(0.0, std::time::Instant::now()) {
-                                    dispatch(SysValue::Map(vec![("level".into(), SysValue::Num(v))]));
-                                }
+                        match std::io::BufRead::fill_buf(&mut p.sock) {
+                            Ok([]) => return Err("the sound server closed the connection".into()),
+                            Ok(_) => {}
+                            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                                tell_level(&*dispatch, meter.silence());
                                 continue;
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(e) => return Err(e.to_string()),
-                        };
+                        }
+                        let desc = protocol::read_descriptor(&mut p.sock).map_err(|e| e.to_string())?;
+                        if desc.length > LEVEL_PACKET_MAX {
+                            return Err(format!("a packet of {} bytes", desc.length));
+                        }
                         buf.resize(desc.length as usize, 0);
                         std::io::Read::read_exact(&mut p.sock, &mut buf).map_err(|e| e.to_string())?;
                         if desc.channel == stream.channel {
-                            if let Some(v) = meter.feed(peak_of(&buf), std::time::Instant::now()) {
-                                dispatch(SysValue::Map(vec![("level".into(), SysValue::Num(v))]));
-                            }
+                            tell_level(&*dispatch, meter.feed(peak_of(&buf), std::time::Instant::now()));
                             continue;
                         }
                         if desc.channel != u32::MAX {
                             continue;
                         }
                         match Command::read_tag_prefixed(&mut std::io::Cursor::new(&buf), p.version) {
-                            // The server changed: if it is the default output, start again on the new one.
-                            Ok((_, Command::SubscribeEvent(_))) => {
-                                let now = Pulse::connect("pleamar level")?.ask::<protocol::ServerInfo>(Command::GetServerInfo)?;
-                                if now.default_sink_name != server.default_sink_name {
+                            // Subscribed (from now on a change is an event, and one made
+                            // since the default was read shows now), or the server changed:
+                            // if the default output is another, start again on it.
+                            Ok((_, Command::Reply | Command::SubscribeEvent(_))) => {
+                                if moved(&mut asker)? {
                                     return Ok(());
                                 }
                             }
+                            Ok((_, Command::Error(e))) => return Err(format!("not subscribed: {e:?}")),
                             Ok((_, Command::RecordStreamKilled(_))) => return Err("the output went away".into()),
                             _ => {}
                         }
                     }
                 };
-                if let Err(e) = run() {
+                let result = run();
+                tell_level(&*dispatch, meter.silence());
+                if let Err(e) = result {
                     eprintln!("audio.level · {e}: trying again");
-                    if let Some(v) = meter.feed(0.0, std::time::Instant::now()) {
-                        dispatch(SysValue::Map(vec![("level".into(), SysValue::Num(v))]));
-                    }
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
             }
@@ -436,5 +474,23 @@ mod tests {
         assert_eq!(m.feed(0.0, t + Duration::from_millis(160)), None);
         assert_eq!(m.feed(0.001, t + Duration::from_millis(190)), None);
         assert_eq!(m.feed(0.5, t + Duration::from_millis(220)), Some(0.5));
+    }
+
+    #[test]
+    fn a_silence_is_told_at_once_and_drops_a_held_peak() {
+        let mut m = Meter::new();
+        let t = Instant::now();
+        // At the start, before any reading: 0.
+        assert_eq!(m.silence(), Some(0.0));
+        assert_eq!(m.silence(), None);
+        assert_eq!(m.feed(0.4, t), Some(0.4));
+        // A louder reading held back by the cap...
+        assert_eq!(m.feed(0.8, t + Duration::from_millis(5)), None);
+        // ...is not told after a silence: the silence is told, now, inside the cap.
+        assert_eq!(m.silence(), Some(0.0));
+        assert_eq!(m.silence(), None);
+        // Sound again is told at once, not held for the cap.
+        assert_eq!(m.feed(0.3, t + Duration::from_millis(7)), Some(0.3));
+        assert_eq!(m.feed(0.0, t + Duration::from_millis(40)), Some(0.0));
     }
 }
