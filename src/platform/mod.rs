@@ -41,7 +41,7 @@ pub enum SysValue {
 ///  · `audio`      → `{ volume = 0.54, muted = false }`
 ///  · `battery`    → `{ present, percent, charging }`
 ///  · `network`    → `{ online, kind = "wired" | "wifi" | "none", name, strength, wifi, networks }` (see `networkmanager`)
-///  · `bluetooth`  → `{ present, powered, discovering, devices }` (see `bluez`)
+///  · `bluetooth`  → `{ present, powered, discovering, devices, pairing, … }` (see `bluez`)
 ///  · `media`      → `{ playing, title, artist, album, length, position, rate, art, player, players }`, or `{ player = "" }` if nothing is playing
 ///  · `clock`      → `{ hour, minute, second, day, month, year, weekday, time, date }`, when the minute changes
 ///  · `clock.seconds` → the same, every second

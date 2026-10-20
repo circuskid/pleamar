@@ -30,7 +30,15 @@ scene Services {
         strength: number
         wifi: bool
     }
-    service bluetooth as bt { present: bool; powered: bool; discovering: bool }
+    service bluetooth as bt {
+        present: bool
+        powered: bool
+        discovering: bool
+        pairing: none | pin | passkey | confirm | display | authorize
+        pairing_address: text
+        pairing_name: text
+        pairing_code: text
+    }
     service media as song { playing: bool; title: text; artist: text; album: text; length: number; position: number; rate: number; art: text; player: text }
     service window as win { title: text; class: text }
     service thumbnails as thumbs { capturing: bool }
@@ -41,6 +49,7 @@ scene Services {
         text "{win.title} ({win.class})" { size: 11; color: #f5f7f5 }
         text "{song.title} — {song.artist} · {song.album} · {song.player}" { size: 11; color: #e8c07a; show: song.playing }
         text "{net.name}" { size: 11; color: #f5f7f5; show: net.online and net.kind == wifi }
+        text "{bt.pairing_name} ({bt.pairing_address}): {bt.pairing_code}?" { size: 11; color: #f5f7f5; show: bt.pairing == confirm }
         row { gap: 6
             box { size: 40 * audio.volume, 4; color: #9ed6bd; show: not audio.muted }
             box { size: 40 * bat.percent, 4; color: #e8c07a; show: bat.present and not bat.charging }
