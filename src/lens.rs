@@ -20,6 +20,10 @@ use crate::platform::Backdrop;
 
 pub struct Pipelines {
     unmix: wgpu::RenderPipeline,
+    /// Unmixing into a draft while counting what says the capture is of
+    /// another frame, and keeping the draft only if almost nothing did
+    /// (`backdrop_check.wgsl`); none where a fragment cannot count (OpenGL).
+    checked: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     own: wgpu::RenderPipeline,
     own_over: wgpu::RenderPipeline,
     linear: wgpu::Sampler,
@@ -54,8 +58,41 @@ impl Pipelines {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        // The same file and the counting, as one module: only where it builds.
+        let checked = {
+            let scope = d.push_error_scope(wgpu::ErrorFilter::Validation);
+            let source = format!("{}{}", include_str!("backdrop.wgsl"), include_str!("backdrop_check.wgsl"));
+            let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("backdrop, checked"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+            let make = |fs: &str| {
+                d.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(fs),
+                    layout: None,
+                    vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some(fs),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let both = (make("unmix_checked"), make("settle"));
+            match pollster::block_on(scope.pop()) {
+                None => Some(both),
+                Some(e) => {
+                    eprintln!("render · the glass unmixes each capture without checking it is of the frame it was taken with ({e})");
+                    None
+                }
+            }
+        };
         Pipelines {
             unmix: pipeline("unmix"),
+            checked,
             own: pipeline("own"),
             own_over: pipeline("own_over"),
             linear,
@@ -103,6 +140,11 @@ pub struct Lens {
     /// it cannot be unmixed.
     backgrounds: [(wgpu::Texture, wgpu::TextureView); 2],
     current: usize,
+    /// What a capture unmixes to before it is known to be of the right frame,
+    /// and how many pixels were looked at and how many said it is not
+    /// (`Pipelines::checked`).
+    draft: (wgpu::Texture, wgpu::TextureView),
+    verdict: wgpu::Buffer,
     frost: Frost,
     /// A sample of the last capture, and of which box it was: so as not to
     /// repeat the work if nothing has changed.
@@ -139,6 +181,8 @@ impl Lens {
             capture: None,
             backgrounds: [background(), background()],
             current: 0,
+            draft: texture(d, "draft", px, wgpu::TextureFormat::Rgba8Unorm, U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
+            verdict: d.create_buffer(&wgpu::BufferDescriptor { label: Some("verdict"), size: 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
             frost: Frost::new(d, px, b),
             sample: Vec::new(),
             pending: None,
@@ -251,18 +295,37 @@ impl Lens {
         // out as a copy of the current one, and only the inside is written.
         let new = self.current ^ 1;
         enc.copy_texture_to_texture(self.backgrounds[self.current].0.as_image_copy(), self.backgrounds[new].0.as_image_copy(), wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 });
-        let unmix_group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &t.unmix.get_bind_group_layout(0),
-            entries: &[
+        let unmixing = |layout: &wgpu::BindGroupLayout, verdict: Option<&wgpu::Buffer>| {
+            let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&capture.1) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.canvases[presented].1) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.backgrounds[self.current].1) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&t.linear) },
                 wgpu::BindGroupEntry { binding: 4, resource: self.bounds_uniforms.as_entire_binding() },
-            ],
-        });
-        pass(enc, &t.unmix, &self.backgrounds[new].1, &unmix_group, scissor);
+            ];
+            if let Some(v) = verdict {
+                entries.push(wgpu::BindGroupEntry { binding: 5, resource: v.as_entire_binding() });
+            }
+            dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
+        };
+        match &t.checked {
+            // Into the draft, counting; then into the new background, or what was there.
+            Some((check, settle)) => {
+                enc.clear_buffer(&self.verdict, 0, None);
+                pass(enc, check, &self.draft.1, &unmixing(&check.get_bind_group_layout(0), Some(&self.verdict)), scissor);
+                let settle_group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &settle.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.draft.1) },
+                        wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.backgrounds[self.current].1) },
+                        wgpu::BindGroupEntry { binding: 8, resource: self.verdict.as_entire_binding() },
+                    ],
+                });
+                pass(enc, settle, &self.backgrounds[new].1, &settle_group, scissor);
+            }
+            None => pass(enc, &t.unmix, &self.backgrounds[new].1, &unmixing(&t.unmix.get_bind_group_layout(0), None), scissor),
+        }
         self.frost.run(g, enc, &self.backgrounds[new].1, scissor, scale);
         self.current = new;
     }

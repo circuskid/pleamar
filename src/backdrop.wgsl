@@ -34,11 +34,18 @@ struct Bounds {
 };
 @group(0) @binding(4) var<uniform> bounds: Bounds;
 
-@fragment
-fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(e.pos.xy);
+// What is unmixed at a pixel, and whether it says that the capture is not of
+// this canvas: under our opaque parts the capture should be ours, and nowhere
+// should what is behind come out as a colour that cannot be.
+struct Unmixed {
+    value: vec4<f32>,
+    wrong: bool,
+};
+
+fn unmix_at(pos: vec2<f32>) -> Unmixed {
+    let px = vec2<i32>(pos);
     // The compositor takes the capture at its own scale: it is read proportionally.
-    let f = textureSampleLevel(capture, linear_sampler, (e.pos.xy - bounds.rect.xy) / bounds.rect.zw, 0.0).rgb;
+    let f = textureSampleLevel(capture, linear_sampler, (pos - bounds.rect.xy) / bounds.rect.zw, 0.0).rgb;
     // Ours, as the compositor blended it: times its opacity.
     let s = textureLoad(canvas, px, 0) * bounds.opacity;
     let a = textureLoad(previous, px, 0);
@@ -47,7 +54,7 @@ fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
     // marked as unknown (alpha 0), and the frosting fills it with what is
     // around. Keeping the last one seen left it stale forever.
     if (remaining < 0.03) {
-        return vec4<f32>(0.0);
+        return Unmixed(vec4<f32>(0.0), any(abs(f - s.rgb) > vec3<f32>(0.1)));
     }
     let background = (f - s.rgb) / remaining;
     // A background that cannot be: the capture is not of this canvas. With a
@@ -55,9 +62,14 @@ fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
     // level over what remains.
     let margin = 0.03 + 0.5 / 255.0 / remaining;
     if (any(background < vec3<f32>(-margin)) || any(background > vec3<f32>(1.0 + margin))) {
-        return a;
+        return Unmixed(a, true);
     }
-    return vec4<f32>(clamp(background, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return Unmixed(vec4<f32>(clamp(background, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0), false);
+}
+
+@fragment
+fn unmix(e: VertexOut) -> @location(0) vec4<f32> {
+    return unmix_at(e.pos.xy).value;
 }
 
 // ── own ───────────────────────────────────────────────────────────
